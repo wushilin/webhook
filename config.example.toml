@@ -1,0 +1,53 @@
+[server]
+bind = "127.0.0.1:8080"
+admin_prefix = "/_wh_admin"
+
+[admin]
+username = "admin"
+# bcrypt hash (recommended; generate with `webhook genpassword`)
+# or a plaintext password. Comment out to disable the admin login entirely.
+password = "changeme"
+
+[storage]
+backend = "local"
+root = "./data"
+
+[retention]
+default_ttl = "30d"
+cleanup_interval = "1h"
+# Empty folders and orphaned files (stale *.json.tmp, body files whose
+# metadata was never written) are only removed once untouched this long.
+prune_grace = "1h"
+
+[body]
+mode = "compressed" # compressed | raw | metadata_only
+preview_limit = "5MiB"
+max_body_size = "100MiB"
+
+[responder]
+status = 200
+body = "metadata_json" # metadata_json | { static_text = "ok" } | { static_json = { success = true } }
+headers = { content-type = "application/json; charset=utf-8" }
+
+[[responders]]
+match = "/api1"
+status = 200
+body = { static_json = { success = true } }
+headers = { x-webhook-debug = "api1" }
+
+[[responders]]
+match = "/api1/test2"
+status = 202
+body = { static_text = "accepted" }
+headers = { content-type = "text/plain; charset=utf-8", x-webhook-debug = "api1-test2" }
+
+[[paths]]
+match = "/large-events"
+ttl = "7d"
+body_mode = "metadata_only"
+
+[[paths]]
+match = "/debug"
+ttl = "30d"
+body_mode = "compressed"
+preview_limit = "5MiB"

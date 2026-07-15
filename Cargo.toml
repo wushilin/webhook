@@ -1,0 +1,33 @@
+[package]
+name = "webhook"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+axum = "0.7"
+bcrypt = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+flate2 = "1.1"
+hostname = "0.4"
+humantime-serde = "1.1"
+mime = "0.3"
+rand = "0.8"
+rpassword = "7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.39", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+urlencoding = "2.1"
+uuid = { version = "1.10", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.15"
