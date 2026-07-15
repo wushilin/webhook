@@ -3,8 +3,7 @@ use std::{collections::BTreeMap, path::Path, path::PathBuf, time::Duration};
 use anyhow::{bail, Context};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -54,6 +53,8 @@ pub struct StorageConfig {
 pub struct RetentionConfig {
     #[serde(default = "default_ttl", with = "humantime_serde")]
     pub default_ttl: Duration,
+    #[serde(default = "default_min_ttl", with = "humantime_serde")]
+    pub min_ttl: Duration,
     #[serde(default = "default_cleanup_interval", with = "humantime_serde")]
     pub cleanup_interval: Duration,
     #[serde(default = "default_prune_grace", with = "humantime_serde")]
@@ -174,12 +175,20 @@ impl std::fmt::Display for BodyMode {
 
 impl Config {
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
-        if path.exists() {
+        let mut config = if path.exists() {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
             toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
         } else {
             Ok(Self::default())
+        }?;
+        config.normalize();
+        Ok(config)
+    }
+
+    fn normalize(&mut self) {
+        while self.server.admin_prefix.len() > 1 && self.server.admin_prefix.ends_with('/') {
+            self.server.admin_prefix.pop();
         }
     }
 
@@ -190,8 +199,10 @@ impl Config {
                 self.storage.backend
             );
         }
-        if !self.server.admin_prefix.starts_with('/') {
-            bail!("server.admin_prefix must start with /");
+        if !valid_admin_prefix(&self.server.admin_prefix) {
+            bail!(
+                "server.admin_prefix must start with /_, be at least 7 characters long, and end with admin"
+            );
         }
         if self.body.preview_limit > self.body.max_body_size {
             bail!("body.preview_limit cannot be greater than body.max_body_size");
@@ -244,6 +255,7 @@ impl Config {
                 resolved.max_body_size = limit;
             }
         }
+        resolved.ttl = resolved.ttl.max(self.retention.min_ttl);
 
         resolved
     }
@@ -272,7 +284,6 @@ impl Config {
         resolved
     }
 }
-
 
 impl Default for AdminConfig {
     fn default() -> Self {
@@ -305,6 +316,7 @@ impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
             default_ttl: default_ttl(),
+            min_ttl: default_min_ttl(),
             cleanup_interval: default_cleanup_interval(),
             prune_grace: default_prune_grace(),
         }
@@ -360,6 +372,10 @@ fn default_ttl() -> Duration {
     Duration::from_secs(30 * 24 * 60 * 60)
 }
 
+fn default_min_ttl() -> Duration {
+    Duration::from_secs(2 * 60 * 60)
+}
+
 fn default_cleanup_interval() -> Duration {
     Duration::from_secs(60 * 60)
 }
@@ -391,6 +407,10 @@ fn validate_header_name(name: &str) -> anyhow::Result<()> {
     axum::http::header::HeaderName::from_bytes(name.as_bytes())
         .with_context(|| format!("invalid responder header name: {name}"))?;
     Ok(())
+}
+
+fn valid_admin_prefix(prefix: &str) -> bool {
+    prefix.starts_with("/_") && prefix.len() >= 7 && prefix.ends_with("admin")
 }
 
 fn path_matches(path: &str, rule: &str) -> bool {
@@ -434,4 +454,54 @@ fn parse_size(value: &str) -> anyhow::Result<u64> {
         other => bail!("invalid size unit: {other}"),
     };
     Ok(number.saturating_mul(multiplier))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_prefix_validation_rejects_ambiguous_capture_prefixes() {
+        assert!(valid_admin_prefix("/_admin"));
+        assert!(valid_admin_prefix("/_wh_admin"));
+        assert!(!valid_admin_prefix("/"));
+        assert!(!valid_admin_prefix("/admin"));
+        assert!(!valid_admin_prefix("/_adm"));
+        assert!(!valid_admin_prefix("/_adminx"));
+    }
+
+    #[test]
+    fn loaded_config_trims_admin_prefix_trailing_slashes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+[server]
+admin_prefix = "/_custom_admin///"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_or_default(tmp.path()).unwrap();
+        assert_eq!(config.server.admin_prefix, "/_custom_admin");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn path_rule_ttl_is_coalesced_to_min_ttl() {
+        let mut config = Config::default();
+        config.retention.min_ttl = Duration::from_secs(2 * 60 * 60);
+        config.paths = vec![PathRule {
+            path_match: "/short".to_string(),
+            ttl: Some(Duration::from_secs(30)),
+            body_mode: None,
+            preview_limit: None,
+            max_body_size: None,
+        }];
+
+        assert_eq!(
+            config.rule_for_path("/short/hook").ttl,
+            Duration::from_secs(2 * 60 * 60)
+        );
+    }
 }

@@ -276,7 +276,7 @@ async fn dashboard(state: AppState) -> Response {
                 &format!(
                     r#"
 <section class="metrics">
-  <div class="tile"><span>Total requests</span><b>{}</b></div>
+  <div class="tile"><span>Requests since restart</span><b>{}</b></div>
   <div class="tile"><span>Complete</span><b>{}</b></div>
   <div class="tile"><span>Incomplete</span><b>{}</b></div>
   <div class="tile"><span>Stored body</span><b>{}</b></div>
@@ -466,11 +466,7 @@ fn method_chip(method: &str) -> String {
         "DELETE" => "delete",
         _ => "other",
     };
-    format!(
-        "<span class=\"method {}\">{}</span>",
-        class,
-        escape(method)
-    )
+    format!("<span class=\"method {}\">{}</span>", class, escape(method))
 }
 
 fn body_status(meta: &RequestMeta) -> String {
@@ -519,7 +515,13 @@ fn login_page(state: &AppState, error: Option<&str>, status: StatusCode) -> Resp
 
 fn page(state: &AppState, title: &str, active: &str, body: &str) -> Response {
     let prefix = state.config.server.admin_prefix.trim_end_matches('/');
-    let nav_class = |name: &str| if name == active { " class=\"active\"" } else { "" };
+    let nav_class = |name: &str| {
+        if name == active {
+            " class=\"active\""
+        } else {
+            ""
+        }
+    };
     let logout = if state.config.admin.password.is_some() {
         format!("<a class=\"logout\" href=\"{prefix}/logout\">Sign out</a>")
     } else {

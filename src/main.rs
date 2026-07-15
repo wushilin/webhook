@@ -207,7 +207,10 @@ async fn capture_request_inner(state: AppState, req: Request<Body>) -> anyhow::R
                     )),
                 },
             );
-            state.storage.write_meta(&paths, &meta).await?;
+            state
+                .storage
+                .write_meta_with_expiry(&paths, &meta, expires_at(received_at, rule.ttl))
+                .await?;
             let capture_response = CaptureResponse {
                 success: false,
                 id,
@@ -256,7 +259,10 @@ async fn capture_request_inner(state: AppState, req: Request<Body>) -> anyhow::R
     };
 
     let meta = build_meta(&id, received_at, method.as_str(), &uri, &headers, body_meta);
-    state.storage.write_meta(&paths, &meta).await?;
+    state
+        .storage
+        .write_meta_with_expiry(&paths, &meta, expires_at(received_at, rule.ttl))
+        .await?;
 
     if capture_response.success {
         let responder = state.config.responder_for_path(&path);
@@ -464,6 +470,14 @@ fn build_meta(
         headers: headers_to_json(headers),
         body,
     }
+}
+
+fn expires_at(
+    received_at: chrono::DateTime<Local>,
+    ttl: std::time::Duration,
+) -> std::time::SystemTime {
+    let received_at: std::time::SystemTime = received_at.into();
+    received_at + ttl
 }
 
 fn parse_content_length(headers: &HeaderMap) -> Option<u64> {
@@ -749,7 +763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn funny_url_path_is_sanitized_for_storage_and_query_is_preserved() {
+    async fn funny_url_path_is_encoded_for_storage_and_query_is_preserved() {
         let server = spawn_test_server(1024).await;
         let request = b"GET /funny/a%20b/%E2%98%83/..%2Fescape?x=1&y=%7Bz%7D HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
@@ -762,9 +776,10 @@ mod tests {
         assert_eq!(record.meta.query.as_deref(), Some("x=1&y=%7Bz%7D"));
 
         let meta_path = record.meta_path.to_string_lossy();
-        assert!(meta_path.contains("/funny/a_b/_/_/"), "{meta_path}");
-        assert!(!meta_path.contains(".."), "{meta_path}");
-        assert!(!meta_path.contains("%2F"), "{meta_path}");
+        assert!(
+            meta_path.contains("/funny/a b/☃/..%2Fescape/"),
+            "{meta_path}"
+        );
     }
 
     #[tokio::test]

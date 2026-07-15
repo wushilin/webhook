@@ -10,10 +10,10 @@ Useful for debugging third-party webhook integrations, inspecting what a client 
 - **Streamed body persistence** — bodies are written to disk as they arrive (never buffered whole in memory), optionally gzip-compressed, with configurable size limits.
 - **JSON metadata sidecar** — method, path, query, headers, timing, and body stats stored as JSON next to each body file.
 - **Path/time-partitioned storage layout** — records are laid out by request path and timestamp for easy `find`/`grep`.
-- **TTL-based retention** — a background worker deletes expired records, orphaned files, and empty folders on a schedule, with per-path TTL overrides.
+- **TTL-based retention** — captures write folder-level expiry markers; a background worker deletes expired folders, orphaned files, and empty folders on a schedule.
 - **Configurable responses** — global and per-path-prefix response status, headers, and body (capture metadata JSON, static text, or static JSON).
 - **Admin UI** — dashboard, request list with path filtering, and request detail pages with body preview, protected by an optional login (bcrypt password, in-memory sessions).
-- **Safe filesystem mapping** — URL paths are sanitized (traversal-safe, hidden files and Windows-reserved names neutralized) before being used as directories; the original path is always preserved verbatim in metadata.
+- **Safe filesystem mapping** — URL path segments are reversibly percent-encoded for filesystem use; the original path is always preserved verbatim in metadata.
 
 ## Quick start
 
@@ -81,7 +81,7 @@ Configuration is TOML. Every section and key is optional — missing keys use th
 ```toml
 [server]
 bind = "127.0.0.1:8080"        # listen address
-admin_prefix = "/_wh_admin"    # URL prefix for the admin UI (must start with /)
+admin_prefix = "/_wh_admin"    # URL prefix for the admin UI (must start with /_, at least 7 chars, end with admin)
 
 [admin]
 username = "admin"
@@ -95,6 +95,7 @@ root = "./data"                # storage root directory
 
 [retention]
 default_ttl = "30d"            # how long records are kept
+min_ttl = "2h"                 # shorter per-path TTLs are raised to this floor
 cleanup_interval = "1h"        # how often the cleanup worker runs
 prune_grace = "1h"             # empty folders / orphaned files are only removed
                                # once untouched this long
@@ -145,7 +146,7 @@ Durations use [humantime](https://docs.rs/humantime) syntax (`30d`, `1h`, `15m`,
 | Key | Default | Description |
 |---|---|---|
 | `bind` | `127.0.0.1:8080` | Socket address to listen on |
-| `admin_prefix` | `/_wh_admin` | Path prefix reserved for the admin UI; everything else is captured |
+| `admin_prefix` | `/_wh_admin` | Path prefix reserved for the admin UI; trailing slashes are trimmed, and the value must start with `/_`, be at least 7 characters long, and end with `admin` |
 
 ### `[admin]`
 
@@ -180,6 +181,7 @@ $ webhook verifypassword
 | Key | Default | Description |
 |---|---|---|
 | `default_ttl` | `30d` | Records older than this are deleted (overridable per `[[paths]]` rule) |
+| `min_ttl` | `2h` | Minimum effective TTL; shorter configured TTLs are coalesced to this value |
 | `cleanup_interval` | `1h` | How often the cleanup worker runs |
 | `prune_grace` | `1h` | Orphaned files and empty folders are only removed once untouched this long |
 
@@ -212,7 +214,8 @@ Per-path-prefix capture behavior. Each rule may override `ttl`, `body_mode`, `pr
 For `POST /test1/test2/test3?aaafe=afafw` received at 16:20:31, local storage writes:
 
 ```text
-data/test1/test2/test3/2026/07/15/16/20/
+data/test1/test2/test3/2026/07/15/16/20/31/
+  .expires_at                                           # Unix epoch seconds for folder expiry
   31_922460000_myhost_AbCdEf1234567890.json          # metadata
   31_922460000_myhost_AbCdEf1234567890.body.bin.gz   # body (".body.bin" in raw mode)
 ```
@@ -243,7 +246,7 @@ The metadata JSON looks like:
 }
 ```
 
-Path segments are sanitized for the filesystem (URL-decoded, traversal-safe, hidden files and Windows-reserved names neutralized, capped at 64 characters per segment and 10 segments deep). The original request path is always preserved verbatim in the metadata.
+Path segments are URL-decoded and then reversibly percent-encoded for filesystem safety. Ordinary readable characters, including Unicode, are kept. Literal `%`, path separators inside encoded segments, control characters, Windows-forbidden characters, `.` / `..`, trailing dot/space, and Windows device names are escaped. The original request path is always preserved verbatim in the metadata.
 
 The body file is written as a stream. If a client disconnects mid-body or an unknown-length body crosses `max_body_size`, the metadata records `complete = false` (and `limit_exceeded = true` in the latter case).
 
@@ -254,7 +257,7 @@ The body file is written as a stream. If a client disconnects mid-body or an unk
 
 ## Retention and cleanup
 
-Every `cleanup_interval`, the server deletes records older than their TTL and then sweeps the storage tree for garbage: stale `*.json.tmp` files, body files whose metadata was never written (e.g. the client never completed the request), and empty folders — including path folders that no longer receive traffic. The sweep only touches files and folders untouched for `prune_grace`, and folder deletion is serialized against request writers with an in-process lock, so an in-flight capture can never lose its directory.
+At capture time, the server resolves the path rule, applies `max(rule_ttl, min_ttl)`, and writes a `.expires_at` marker into the second-level capture folder. Every `cleanup_interval`, cleanup deletes folders whose marker is expired without opening each metadata JSON. It separately sweeps garbage such as stale `*.json.tmp`, stale `.expires_at.*.tmp`, body files whose metadata was never written, and empty folders; that garbage sweep only touches files and folders untouched for `prune_grace`.
 
 ## Admin UI
 
@@ -262,7 +265,7 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 
 | Route | Description |
 |---|---|
-| `/_wh_admin/` | Dashboard |
+| `/_wh_admin/` | Dashboard with in-memory stats since process start |
 | `/_wh_admin/requests` | Recent requests, filterable by path |
 | `/_wh_admin/requests/<id>` | Request detail with headers and body preview |
 | `/_wh_admin/login`, `/logout` | Session login/logout (only when `admin.password` is set) |

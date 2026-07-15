@@ -1,6 +1,6 @@
 use std::{
-    path::{Component, Path, PathBuf},
-    time::{Duration, SystemTime},
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -9,14 +9,12 @@ use tokio::{fs, io::AsyncWriteExt, sync::RwLock};
 
 use crate::{config, models::RequestMeta};
 
-/// Longest sanitized path segment kept for on-disk directory names; most
-/// filesystems cap a single name at 255 bytes and the full path near 1024.
-const MAX_SEGMENT_LEN: usize = 64;
-const MAX_SEGMENTS: usize = 10;
+const EXPIRES_AT_FILE: &str = ".expires_at";
 
 #[derive(Debug)]
 pub struct LocalStorage {
     root: PathBuf,
+    stats: RwLock<StatsAccumulator>,
     /// Serializes directory deletion against file/directory creation.
     /// Writers take it shared around `create_dir_all` + file create; the
     /// retention pruner takes it exclusive while it re-checks that a
@@ -49,10 +47,21 @@ pub struct DashboardStats {
     pub top_methods: Vec<(String, usize)>,
 }
 
+#[derive(Debug, Default)]
+struct StatsAccumulator {
+    total_requests: usize,
+    complete_requests: usize,
+    incomplete_requests: usize,
+    stored_body_bytes: u64,
+    paths: std::collections::BTreeMap<String, usize>,
+    methods: std::collections::BTreeMap<String, usize>,
+}
+
 impl LocalStorage {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
+            stats: RwLock::new(StatsAccumulator::default()),
             dir_lock: RwLock::new(()),
         }
     }
@@ -82,6 +91,7 @@ impl LocalStorage {
         base.push(format!("{:02}", received_at.day()));
         base.push(format!("{:02}", received_at.hour()));
         base.push(format!("{:02}", received_at.minute()));
+        base.push(format!("{:02}", received_at.second()));
 
         let meta_path = base.join(format!("{id}.json"));
         let (body_path, body_file_name) = body_mode
@@ -99,10 +109,20 @@ impl LocalStorage {
         }
     }
 
-    pub async fn write_meta(
+    pub async fn write_meta_with_expiry(
         &self,
         paths: &StoredRequestPaths,
         meta: &RequestMeta,
+        expires_at: SystemTime,
+    ) -> anyhow::Result<()> {
+        self.write_meta_inner(paths, meta, Some(expires_at)).await
+    }
+
+    async fn write_meta_inner(
+        &self,
+        paths: &StoredRequestPaths,
+        meta: &RequestMeta,
+        expires_at: Option<SystemTime>,
     ) -> anyhow::Result<()> {
         let json = serde_json::to_vec_pretty(meta)?;
         let tmp = paths.meta_path.with_extension("json.tmp");
@@ -117,6 +137,10 @@ impl LocalStorage {
         file.write_all(b"\n").await?;
         file.shutdown().await?;
         fs::rename(&tmp, &paths.meta_path).await?;
+        if let Some(expires_at) = expires_at {
+            self.write_expires_at(paths, meta, expires_at).await?;
+        }
+        self.record_stats(meta).await;
         Ok(())
     }
 
@@ -205,26 +229,7 @@ impl LocalStorage {
     }
 
     pub async fn dashboard(&self) -> anyhow::Result<DashboardStats> {
-        let records = self.recent(5000, None).await?;
-        let mut stats = DashboardStats::default();
-        let mut paths = std::collections::BTreeMap::<String, usize>::new();
-        let mut methods = std::collections::BTreeMap::<String, usize>::new();
-
-        for record in records {
-            stats.total_requests += 1;
-            if record.meta.body.complete {
-                stats.complete_requests += 1;
-            } else {
-                stats.incomplete_requests += 1;
-            }
-            stats.stored_body_bytes += record.meta.body.stored_size;
-            *paths.entry(record.meta.path).or_default() += 1;
-            *methods.entry(record.meta.method).or_default() += 1;
-        }
-
-        stats.top_paths = sorted_counts(paths, 8);
-        stats.top_methods = sorted_counts(methods, 8);
-        Ok(stats)
+        Ok(self.stats.read().await.snapshot())
     }
 
     pub async fn cleanup_expired(&self, config: &config::Config) -> anyhow::Result<()> {
@@ -235,13 +240,46 @@ impl LocalStorage {
         let mut dirs = Vec::new();
         collect_entries(&self.root, &mut files, &mut dirs).await?;
 
-        let (json_files, other_files): (Vec<_>, Vec<_>) = files
+        let (expires_at_files, other_files): (Vec<_>, Vec<_>) = files
             .into_iter()
-            .partition(|path| path.extension().and_then(|e| e.to_str()) == Some("json"));
+            .partition(|path| path.file_name().and_then(|n| n.to_str()) == Some(EXPIRES_AT_FILE));
+        let expires_at_dirs: std::collections::HashSet<PathBuf> = expires_at_files
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect();
 
-        // Pass 1: delete expired records; their folders are known-stale, so
-        // prune the now-empty chain immediately.
-        for file in &json_files {
+        // Pass 1: delete expired leaf folders using the folder-level expiry
+        // marker written at capture time. This avoids opening every metadata
+        // JSON during routine cleanup.
+        for file in &expires_at_files {
+            let Ok(expires_at) = read_expires_at(file).await else {
+                continue;
+            };
+            if expires_at > now {
+                continue;
+            }
+            let Some(folder) = file.parent() else {
+                continue;
+            };
+            if folder == self.root {
+                continue;
+            }
+            let _guard = self.dir_lock.write().await;
+            let _ = fs::remove_dir_all(folder).await;
+            drop(_guard);
+            self.prune_dir_chain(folder.parent()).await;
+        }
+
+        // Pass 2: migrate cleanup behavior for legacy markerless records.
+        // New folders have `.expires_at`, so routine cleanup does not open
+        // each metadata JSON.
+        for file in other_files.iter().filter(|path| {
+            path.extension().and_then(|e| e.to_str()) == Some("json")
+                && path
+                    .parent()
+                    .map(|parent| !expires_at_dirs.contains(parent))
+                    .unwrap_or(false)
+        }) {
             let Ok(meta) = read_meta(file).await else {
                 continue;
             };
@@ -262,7 +300,7 @@ impl LocalStorage {
             self.prune_dir_chain(file.parent()).await;
         }
 
-        // Pass 2: delete orphans — stale meta tmp files (crash between create
+        // Pass 3: delete orphans — stale meta tmp files (crash between create
         // and rename) and body files whose meta was never written. The grace
         // period keeps in-flight writes safe: an active body stream refreshes
         // its file mtime on every chunk.
@@ -273,7 +311,9 @@ impl LocalStorage {
             let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let orphan = if name.ends_with(".json.tmp") {
+            let orphan = if name.ends_with(".json.tmp")
+                || (name.starts_with(".expires_at.") && name.ends_with(".tmp"))
+            {
                 true
             } else if let Some(id) = name
                 .strip_suffix(".body.bin.gz")
@@ -290,7 +330,7 @@ impl LocalStorage {
             }
         }
 
-        // Pass 3: sweep empty folders, deepest first. Only folders whose
+        // Pass 4: sweep empty folders, deepest first. Only folders whose
         // mtime is past the grace period are considered — writers only ever
         // create entries in the folder for the current time window, so an
         // old-mtime empty folder cannot be an active write target. The
@@ -327,6 +367,57 @@ impl LocalStorage {
             }
         }
     }
+
+    async fn record_stats(&self, meta: &RequestMeta) {
+        let mut stats = self.stats.write().await;
+        stats.total_requests += 1;
+        if meta.body.complete {
+            stats.complete_requests += 1;
+        } else {
+            stats.incomplete_requests += 1;
+        }
+        stats.stored_body_bytes = stats
+            .stored_body_bytes
+            .saturating_add(meta.body.stored_size);
+        *stats.paths.entry(meta.path.clone()).or_default() += 1;
+        *stats.methods.entry(meta.method.clone()).or_default() += 1;
+    }
+
+    async fn write_expires_at(
+        &self,
+        paths: &StoredRequestPaths,
+        meta: &RequestMeta,
+        expires_at: SystemTime,
+    ) -> anyhow::Result<()> {
+        let Some(parent) = paths.meta_path.parent() else {
+            return Ok(());
+        };
+        let path = parent.join(EXPIRES_AT_FILE);
+        let existing = read_expires_at(&path).await.ok();
+        let expires_at = existing
+            .map(|old| old.max(expires_at))
+            .unwrap_or(expires_at);
+        let value = epoch_seconds(expires_at).to_string();
+        let tmp = parent.join(format!(".expires_at.{}.tmp", meta.id));
+
+        let _guard = self.dir_lock.read().await;
+        fs::write(&tmp, value).await?;
+        fs::rename(&tmp, &path).await?;
+        Ok(())
+    }
+}
+
+impl StatsAccumulator {
+    fn snapshot(&self) -> DashboardStats {
+        DashboardStats {
+            total_requests: self.total_requests,
+            complete_requests: self.complete_requests,
+            incomplete_requests: self.incomplete_requests,
+            stored_body_bytes: self.stored_body_bytes,
+            top_paths: sorted_counts(self.paths.clone(), 8),
+            top_methods: sorted_counts(self.methods.clone(), 8),
+        }
+    }
 }
 
 impl StoredRequestPaths {
@@ -345,6 +436,15 @@ impl StoredRequestPaths {
 async fn read_meta(path: &Path) -> anyhow::Result<RequestMeta> {
     let text = fs::read_to_string(path).await?;
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+async fn read_expires_at(path: &Path) -> anyhow::Result<SystemTime> {
+    let text = fs::read_to_string(path).await?;
+    let seconds = text
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(UNIX_EPOCH + Duration::from_secs(seconds))
 }
 
 async fn collect_json_files(root: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
@@ -406,15 +506,8 @@ async fn dir_is_empty(dir: &Path) -> bool {
 fn request_path_segments(path: &str) -> Vec<String> {
     let mut segments = Vec::new();
     for raw in path.split('/').filter(|raw| !raw.is_empty()) {
-        if segments.len() >= MAX_SEGMENTS {
-            segments.push("_overflow".to_string());
-            break;
-        }
         let decoded = urlencoding::decode(raw).unwrap_or_else(|_| raw.into());
-        let cleaned = sanitize_path_segment(&decoded);
-        if !cleaned.is_empty() {
-            segments.push(cleaned);
-        }
+        segments.push(encode_path_segment(&decoded));
     }
     if segments.is_empty() {
         segments.push("_root".to_string());
@@ -422,39 +515,54 @@ fn request_path_segments(path: &str) -> Vec<String> {
     segments
 }
 
-fn sanitize_path_segment(segment: &str) -> String {
-    let path = Path::new(segment);
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return "_".to_string();
+fn encode_path_segment(segment: &str) -> String {
+    if segment == "." {
+        return "%2E".to_string();
     }
-    let mut cleaned: String = segment
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '=') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.bytes().all(|b| b == b'.') {
-        return "_".to_string();
+    if segment == ".." {
+        return "%2E%2E".to_string();
     }
-    // No hidden files, no Windows-reserved device names, no trailing dot
-    // (stripped by Windows), and nothing longer than a filesystem allows.
-    if cleaned.starts_with('.') || is_reserved_windows_name(&cleaned) {
-        cleaned.insert(0, '_');
+
+    let mut encoded = String::new();
+    let chars: Vec<(usize, char)> = segment.char_indices().collect();
+    let last_char_start = chars.last().map(|(idx, _)| *idx);
+    for (idx, c) in chars {
+        let is_trailing_bad = Some(idx) == last_char_start && matches!(c, '.' | ' ');
+        if is_trailing_bad || should_escape_char(c) {
+            push_percent_encoded(&mut encoded, c);
+        } else {
+            encoded.push(c);
+        }
     }
-    if let Some(stripped) = cleaned.strip_suffix('.') {
-        cleaned = format!("{stripped}_");
+
+    if is_reserved_windows_name(segment) {
+        encode_first_char(segment)
+    } else {
+        encoded
     }
-    cleaned.truncate(MAX_SEGMENT_LEN);
-    cleaned
+}
+
+fn should_escape_char(c: char) -> bool {
+    c == '%' || c.is_control() || matches!(c, '/' | '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*')
+}
+
+fn push_percent_encoded(out: &mut String, c: char) {
+    let mut buf = [0u8; 4];
+    for byte in c.encode_utf8(&mut buf).as_bytes() {
+        out.push('%');
+        out.push_str(&format!("{byte:02X}"));
+    }
+}
+
+fn encode_first_char(segment: &str) -> String {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut encoded = String::new();
+    push_percent_encoded(&mut encoded, first);
+    encoded.push_str(chars.as_str());
+    encoded
 }
 
 fn is_reserved_windows_name(name: &str) -> bool {
@@ -464,6 +572,12 @@ fn is_reserved_windows_name(name: &str) -> bool {
         || (upper.len() == 4
             && (upper.starts_with("COM") || upper.starts_with("LPT"))
             && upper.as_bytes()[3].is_ascii_digit())
+}
+
+fn epoch_seconds(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 fn sorted_counts(
@@ -514,23 +628,17 @@ mod tests {
     }
 
     #[test]
-    fn segments_are_filesystem_safe() {
-        assert_eq!(request_path_segments("/a/./b"), vec!["a", "_", "b"]);
-        assert_eq!(request_path_segments("/.."), vec!["_"]);
-        assert_eq!(request_path_segments("/.hidden"), vec!["_.hidden"]);
-        assert_eq!(request_path_segments("/nul"), vec!["_nul"]);
-        assert_eq!(request_path_segments("/COM1.txt"), vec!["_COM1.txt"]);
-        assert_eq!(request_path_segments("/trailing."), vec!["trailing_"]);
+    fn segments_are_reversible_and_filesystem_safe() {
+        assert_eq!(request_path_segments("/a/./b"), vec!["a", "%2E", "b"]);
+        assert_eq!(request_path_segments("/.."), vec!["%2E%2E"]);
+        assert_eq!(request_path_segments("/.hidden"), vec![".hidden"]);
+        assert_eq!(request_path_segments("/nul"), vec!["%6Eul"]);
+        assert_eq!(request_path_segments("/COM1.txt"), vec!["%43OM1.txt"]);
+        assert_eq!(request_path_segments("/trailing."), vec!["trailing%2E"]);
+        assert_eq!(request_path_segments("/a%2Fb"), vec!["a%2Fb"]);
+        assert_eq!(request_path_segments("/100%25"), vec!["100%25"]);
+        assert_eq!(request_path_segments("/snow/%E2%98%83"), vec!["snow", "☃"]);
         assert_eq!(request_path_segments("/"), vec!["_root"]);
-
-        let long = "x".repeat(300);
-        let segments = request_path_segments(&format!("/{long}"));
-        assert_eq!(segments[0].len(), MAX_SEGMENT_LEN);
-
-        let deep = "/a".repeat(30);
-        let segments = request_path_segments(&deep);
-        assert_eq!(segments.len(), MAX_SEGMENTS + 1);
-        assert_eq!(segments.last().unwrap(), "_overflow");
     }
 
     #[tokio::test]
@@ -544,7 +652,11 @@ mod tests {
         file.write_all(b"payload").await.unwrap();
         file.shutdown().await.unwrap();
         storage
-            .write_meta(&paths, &test_meta("id1", "/svc/hook", paths.body_file_name()))
+            .write_meta_with_expiry(
+                &paths,
+                &test_meta("id1", "/svc/hook", paths.body_file_name()),
+                SystemTime::now() - Duration::from_secs(1),
+            )
             .await
             .unwrap();
 
@@ -571,9 +683,16 @@ mod tests {
         file.write_all(b"data").await.unwrap();
         file.shutdown().await.unwrap();
         storage
-            .write_meta(&paths, &test_meta("live1", "/live", paths.body_file_name()))
+            .write_meta_with_expiry(
+                &paths,
+                &test_meta("live1", "/live", paths.body_file_name()),
+                SystemTime::now() + Duration::from_secs(3600),
+            )
             .await
             .unwrap();
+        let stats = storage.dashboard().await.unwrap();
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.top_paths, vec![("/live".to_string(), 1)]);
 
         let stale_dir = storage.root().join("gone").join("2026").join("01");
         fs::create_dir_all(&stale_dir).await.unwrap();
@@ -593,10 +712,8 @@ mod tests {
         assert!(!fs::try_exists(storage.root().join("gone")).await.unwrap());
         assert!(!fs::try_exists(storage.root().join("empty")).await.unwrap());
         assert!(fs::try_exists(&paths.meta_path).await.unwrap());
-        assert!(
-            fs::try_exists(paths.body_path.as_ref().unwrap())
-                .await
-                .unwrap()
-        );
+        assert!(fs::try_exists(paths.body_path.as_ref().unwrap())
+            .await
+            .unwrap());
     }
 }

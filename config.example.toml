@@ -14,6 +14,7 @@ root = "./data"
 
 [retention]
 default_ttl = "30d"
+min_ttl = "2h"
 cleanup_interval = "1h"
 # Empty folders and orphaned files (stale *.json.tmp, body files whose
 # metadata was never written) are only removed once untouched this long.
