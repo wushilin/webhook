@@ -285,6 +285,41 @@ impl Config {
     }
 }
 
+pub fn default_config_toml() -> &'static str {
+    r#"[server]
+bind = "127.0.0.1:8080"
+admin_prefix = "/_wh_admin"
+
+[admin]
+username = "admin"
+# bcrypt hash (recommended; generate with `webhook genpassword`)
+# or a plaintext password. Comment out to disable the admin login entirely.
+# password = "$2b$12$..."
+
+[storage]
+backend = "local"
+root = "./data"
+
+[retention]
+default_ttl = "30d"
+min_ttl = "2h"
+cleanup_interval = "1h"
+# Empty folders and orphaned files (stale *.json.tmp, body files whose
+# metadata was never written) are only removed once untouched this long.
+prune_grace = "1h"
+
+[body]
+mode = "compressed" # compressed | raw | metadata_only
+preview_limit = "5MiB"
+max_body_size = "100MiB"
+
+[responder]
+status = 200
+body = "metadata_json" # metadata_json | { static_text = "ok" } | { static_json = { success = true } }
+headers = { content-type = "application/json; charset=utf-8" }
+"#
+}
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
@@ -503,5 +538,35 @@ admin_prefix = "/_custom_admin///"
             config.rule_for_path("/short/hook").ttl,
             Duration::from_secs(2 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn generated_default_config_is_valid_and_matches_defaults() {
+        let mut parsed: Config = toml::from_str(default_config_toml()).unwrap();
+        parsed.normalize();
+        parsed.validate().unwrap();
+
+        let default = Config::default();
+        assert_eq!(parsed.server.bind, default.server.bind);
+        assert_eq!(parsed.server.admin_prefix, default.server.admin_prefix);
+        assert_eq!(parsed.admin.username, default.admin.username);
+        assert_eq!(parsed.admin.password, default.admin.password);
+        assert_eq!(parsed.storage.backend, default.storage.backend);
+        assert_eq!(parsed.storage.root, default.storage.root);
+        assert_eq!(parsed.retention.default_ttl, default.retention.default_ttl);
+        assert_eq!(parsed.retention.min_ttl, default.retention.min_ttl);
+        assert_eq!(
+            parsed.retention.cleanup_interval,
+            default.retention.cleanup_interval
+        );
+        assert_eq!(parsed.retention.prune_grace, default.retention.prune_grace);
+        assert_eq!(parsed.body.mode, default.body.mode);
+        assert_eq!(parsed.body.preview_limit, default.body.preview_limit);
+        assert_eq!(parsed.body.max_body_size, default.body.max_body_size);
+        assert_eq!(parsed.responder.status, default.responder.status);
+        assert_eq!(parsed.responder.headers, default.responder.headers);
+        assert!(matches!(parsed.responder.body, ResponderBody::MetadataJson));
+        assert!(parsed.responders.is_empty());
+        assert!(parsed.paths.is_empty());
     }
 }

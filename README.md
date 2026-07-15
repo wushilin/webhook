@@ -21,12 +21,15 @@ Useful for debugging third-party webhook integrations, inspecting what a client 
 # build
 cargo build --release
 
-# run with a config file (defaults to ./config.toml; falls back to
-# built-in defaults if the file does not exist)
-./target/release/webhook --config config.example.toml
+# generate a default config
+./target/release/webhook genconfig > config.toml
+
+# run with a config file
+./target/release/webhook run -c config.toml
 
 # or via cargo
-cargo run -- --config config.example.toml
+cargo run -- genconfig > config.toml
+cargo run -- run -c config.toml
 ```
 
 Send it anything:
@@ -60,21 +63,23 @@ Then browse captured requests in the admin UI at `http://127.0.0.1:8080/_wh_admi
 ## Command line
 
 ```text
-webhook [--config <FILE>] [SUBCOMMAND]
-
-Options:
-  -c, --config <FILE>   Config file path [env: WEBHOOK_CONFIG] [default: config.toml]
+webhook [COMMAND]
 
 Subcommands:
+  run             Run the webhook capture server
+  genconfig       Print a default TOML config to stdout
   genpassword     Prompt for a password and print its bcrypt hash for admin.password
   verifypassword  Check whether a plaintext password matches a stored (bcrypt or plaintext) value
+
+Run options:
+  -c, --config <FILE>   Config file path [env: WEBHOOK_CONFIG] [default: config.toml]
 ```
 
 Logging is JSON via `tracing`, controlled with `RUST_LOG` (e.g. `RUST_LOG=info`).
 
 ## Configuration
 
-Configuration is TOML. Every section and key is optional — missing keys use the defaults shown below. See [`config.example.toml`](config.example.toml) for a complete working example.
+Configuration is TOML. Every section and key is optional — missing keys use the defaults shown below. Generate a default file with `webhook genconfig > config.toml`, or see [`config.example.toml`](config.example.toml) for a complete working example with sample path rules.
 
 ### Full example
 

@@ -15,7 +15,7 @@ use axum::{
     Router,
 };
 use chrono::Local;
-use clap::{Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use futures_util::StreamExt;
 use models::{BodyMeta, CaptureResponse, RequestMeta};
 use rand::{distributions::Alphanumeric, Rng};
@@ -26,18 +26,28 @@ use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(short, long, env = "WEBHOOK_CONFIG", default_value = "config.toml")]
-    config: PathBuf,
+    #[arg(short, long, env = "WEBHOOK_CONFIG", hide = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run the webhook capture server
+    Run(RunArgs),
+    /// Print a default TOML config to stdout
+    Genconfig,
     /// Prompt for a password and print its bcrypt hash for admin.password
     Genpassword,
     /// Check whether a plaintext password matches a stored (bcrypt or plaintext) password
     Verifypassword,
+}
+
+#[derive(ClapArgs, Debug)]
+struct RunArgs {
+    #[arg(short, long, env = "WEBHOOK_CONFIG", default_value = "config.toml")]
+    config: PathBuf,
 }
 
 #[derive(Clone)]
@@ -56,13 +66,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    match args.command {
+    let config_path = match args.command {
+        Some(Command::Run(run_args)) => run_args.config,
+        Some(Command::Genconfig) => return genconfig(),
         Some(Command::Genpassword) => return genpassword(),
         Some(Command::Verifypassword) => return verifypassword(),
-        None => {}
-    }
+        None => args.config.unwrap_or_else(|| PathBuf::from("config.toml")),
+    };
 
-    let config = Arc::new(config::Config::load_or_default(&args.config)?);
+    let config = Arc::new(config::Config::load_or_default(&config_path)?);
     config.validate()?;
 
     match config.admin.password.as_deref() {
@@ -103,6 +115,11 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    Ok(())
+}
+
+fn genconfig() -> anyhow::Result<()> {
+    print!("{}", config::default_config_toml());
     Ok(())
 }
 
@@ -801,6 +818,30 @@ mod tests {
         assert!(!meta.body.complete);
         assert_eq!(meta.body.original_size, 5);
         assert!(meta.body.error.is_some());
+    }
+
+    #[test]
+    fn cli_accepts_explicit_run_config_path() {
+        let args = Args::try_parse_from(["webhook", "run", "-c", "custom.toml"]).unwrap();
+        match args.command {
+            Some(Command::Run(run_args)) => {
+                assert_eq!(run_args.config, PathBuf::from("custom.toml"))
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_keeps_no_subcommand_as_run_default() {
+        let args = Args::try_parse_from(["webhook"]).unwrap();
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn cli_keeps_legacy_top_level_config_for_default_run() {
+        let args = Args::try_parse_from(["webhook", "-c", "legacy.toml"]).unwrap();
+        assert_eq!(args.config, Some(PathBuf::from("legacy.toml")));
+        assert!(args.command.is_none());
     }
 
     #[test]
