@@ -166,33 +166,63 @@ impl LocalStorage {
         limit: usize,
         path_filter: Option<&str>,
     ) -> anyhow::Result<Vec<RequestRecord>> {
-        let mut files = Vec::new();
-        collect_json_files(&self.root, &mut files).await?;
+        // A filter can only match records stored under the filter's own
+        // directory subtree, so start the walk there.
+        let walk_root = match path_filter {
+            Some(filter) if !filter.trim_matches('/').is_empty() => {
+                let mut base = self.root.clone();
+                for segment in request_path_segments(filter) {
+                    base.push(segment);
+                }
+                base
+            }
+            _ => self.root.clone(),
+        };
+
+        // Enumerate the per-second leaf folders by name only, newest first,
+        // and stop reading metadata once the limit is reached instead of
+        // parsing every record on disk.
+        let mut leaves = collect_leaf_time_dirs(&walk_root).await?;
+        leaves.sort_by_key(|leaf| std::cmp::Reverse(leaf.key));
 
         let mut records = Vec::new();
-        for file in files {
-            let Ok(meta) = read_meta(&file).await else {
-                continue;
-            };
-            if let Some(filter) = path_filter {
-                if meta.path != filter
-                    && !meta
-                        .path
-                        .starts_with(&format!("{}/", filter.trim_end_matches('/')))
-                {
-                    continue;
+        let mut stop_key = None;
+        for leaf in leaves {
+            if let Some(stop_key) = stop_key {
+                // Folder names are second-granularity while `received_at` is
+                // not, so finish every folder sharing the second in which the
+                // limit was reached before stopping.
+                if leaf.key < stop_key {
+                    break;
                 }
             }
-            let body_path = meta
-                .body
-                .object
-                .as_ref()
-                .and_then(|name| file.parent().map(|parent| parent.join(name)));
-            records.push(RequestRecord {
-                meta,
-                meta_path: file,
-                body_path,
-            });
+            for file in leaf.json_files {
+                let Ok(meta) = read_meta(&file).await else {
+                    continue;
+                };
+                if let Some(filter) = path_filter {
+                    if meta.path != filter
+                        && !meta
+                            .path
+                            .starts_with(&format!("{}/", filter.trim_end_matches('/')))
+                    {
+                        continue;
+                    }
+                }
+                let body_path = meta
+                    .body
+                    .object
+                    .as_ref()
+                    .and_then(|name| file.parent().map(|parent| parent.join(name)));
+                records.push(RequestRecord {
+                    meta,
+                    meta_path: file,
+                    body_path,
+                });
+            }
+            if stop_key.is_none() && records.len() >= limit {
+                stop_key = Some(leaf.key);
+            }
         }
         records.sort_by(|a, b| {
             b.meta
@@ -459,6 +489,64 @@ async fn collect_json_files(root: &Path, out: &mut Vec<PathBuf>) -> anyhow::Resu
     Ok(())
 }
 
+/// A per-second leaf folder holding metadata JSON files, keyed by the
+/// timestamp encoded in its trailing `YYYY/MM/DD/HH/MM/SS` components.
+struct LeafTimeDir {
+    key: (i32, u32, u32, u32, u32, u32),
+    json_files: Vec<PathBuf>,
+}
+
+async fn collect_leaf_time_dirs(root: &Path) -> anyhow::Result<Vec<LeafTimeDir>> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = fs::read_dir(&dir).await else {
+            continue;
+        };
+        let mut json_files = Vec::new();
+        // Entries can vanish mid-scan (retention races a request burst), so
+        // tolerate per-entry errors instead of aborting the walk.
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            match entry.file_type().await {
+                Ok(file_type) if file_type.is_dir() => stack.push(path),
+                Ok(_) if path.extension().and_then(|e| e.to_str()) == Some("json") => {
+                    json_files.push(path);
+                }
+                _ => {}
+            }
+        }
+        if !json_files.is_empty() {
+            leaves.push(LeafTimeDir {
+                key: leaf_time_key(&dir),
+                json_files,
+            });
+        }
+    }
+    Ok(leaves)
+}
+
+/// Metadata JSON files only ever live in the per-second folder, so the leaf's
+/// last six path components are its timestamp regardless of what the request
+/// path segments above them look like. Unparsable folders sort oldest so they
+/// are only read when the limit has not been reached.
+fn leaf_time_key(dir: &Path) -> (i32, u32, u32, u32, u32, u32) {
+    fn parse<T: std::str::FromStr>(component: Option<&std::ffi::OsStr>) -> Option<T> {
+        component?.to_str()?.parse().ok()
+    }
+    let mut components = dir.iter().rev();
+    let second = parse(components.next());
+    let minute = parse(components.next());
+    let hour = parse(components.next());
+    let day = parse(components.next());
+    let month = parse(components.next());
+    let year = parse(components.next());
+    match (year, month, day, hour, minute, second) {
+        (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) => (y, mo, d, h, mi, s),
+        _ => (i32::MIN, 0, 0, 0, 0, 0),
+    }
+}
+
 async fn collect_entries(
     root: &Path,
     files: &mut Vec<PathBuf>,
@@ -639,6 +727,38 @@ mod tests {
         assert_eq!(request_path_segments("/100%25"), vec!["100%25"]);
         assert_eq!(request_path_segments("/snow/%E2%98%83"), vec!["snow", "☃"]);
         assert_eq!(request_path_segments("/"), vec!["_root"]);
+    }
+
+    #[tokio::test]
+    async fn recent_returns_newest_records_up_to_limit() {
+        let tmp = TempDir::new().unwrap();
+        let storage = LocalStorage::new(tmp.path().join("data"));
+        storage.ensure_root().await.unwrap();
+
+        let start = Local::now();
+        for i in 0..5u64 {
+            let received_at = start - chrono::Duration::seconds(i as i64);
+            let path = if i % 2 == 0 { "/a" } else { "/b/sub" };
+            let id = format!("id{i}");
+            let paths = storage.paths_for(path, received_at, &id, config::BodyMode::MetadataOnly);
+            let mut meta = test_meta(&id, path, None);
+            meta.received_at = received_at;
+            storage
+                .write_meta_with_expiry(&paths, &meta, SystemTime::now() + Duration::from_secs(3600))
+                .await
+                .unwrap();
+        }
+
+        let records = storage.recent(3, None).await.unwrap();
+        let ids: Vec<_> = records.iter().map(|r| r.meta.id.as_str()).collect();
+        assert_eq!(ids, vec!["id0", "id1", "id2"]);
+
+        let records = storage.recent(10, Some("/b")).await.unwrap();
+        let ids: Vec<_> = records.iter().map(|r| r.meta.id.as_str()).collect();
+        assert_eq!(ids, vec!["id1", "id3"]);
+
+        let records = storage.recent(10, Some("/missing")).await.unwrap();
+        assert!(records.is_empty());
     }
 
     #[tokio::test]
