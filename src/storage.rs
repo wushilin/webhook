@@ -1,20 +1,27 @@
 use std::{
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
 use chrono::{Datelike, Local, Timelike};
+use futures_util::future::BoxFuture;
 use tokio::{fs, io::AsyncWriteExt, sync::RwLock};
 
 use crate::{config, models::RequestMeta};
 
 const EXPIRES_AT_FILE: &str = ".expires_at";
+const RECENT_REQUEST_LIMIT: usize = 5_000;
+const PATH_STATS_IDLE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const PATH_STATS_LIMIT: usize = 5_000;
+const PATH_STATS_PRUNE_TARGET: usize = PATH_STATS_LIMIT * 9 / 10;
 
 #[derive(Debug)]
 pub struct LocalStorage {
     root: PathBuf,
     stats: RwLock<StatsAccumulator>,
+    recent: RwLock<VecDeque<RequestRecord>>,
     /// Serializes directory deletion against file/directory creation.
     /// Writers take it shared around `create_dir_all` + file create; the
     /// retention pruner takes it exclusive while it re-checks that a
@@ -53,8 +60,14 @@ struct StatsAccumulator {
     complete_requests: usize,
     incomplete_requests: usize,
     stored_body_bytes: u64,
-    paths: std::collections::BTreeMap<String, usize>,
-    methods: std::collections::BTreeMap<String, usize>,
+    paths: BTreeMap<String, PathStats>,
+    methods: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PathStats {
+    count: usize,
+    last_seen: SystemTime,
 }
 
 impl LocalStorage {
@@ -62,6 +75,7 @@ impl LocalStorage {
         Self {
             root,
             stats: RwLock::new(StatsAccumulator::default()),
+            recent: RwLock::new(VecDeque::with_capacity(RECENT_REQUEST_LIMIT)),
             dir_lock: RwLock::new(()),
         }
     }
@@ -140,7 +154,7 @@ impl LocalStorage {
         if let Some(expires_at) = expires_at {
             self.write_expires_at(paths, meta, expires_at).await?;
         }
-        self.record_stats(meta).await;
+        self.record_capture(paths, meta).await;
         Ok(())
     }
 
@@ -166,64 +180,15 @@ impl LocalStorage {
         limit: usize,
         path_filter: Option<&str>,
     ) -> anyhow::Result<Vec<RequestRecord>> {
-        // A filter can only match records stored under the filter's own
-        // directory subtree, so start the walk there.
-        let walk_root = match path_filter {
-            Some(filter) if !filter.trim_matches('/').is_empty() => {
-                let mut base = self.root.clone();
-                for segment in request_path_segments(filter) {
-                    base.push(segment);
-                }
-                base
-            }
-            _ => self.root.clone(),
-        };
-
-        // Enumerate the per-second leaf folders by name only, newest first,
-        // and stop reading metadata once the limit is reached instead of
-        // parsing every record on disk.
-        let mut leaves = collect_leaf_time_dirs(&walk_root).await?;
-        leaves.sort_by_key(|leaf| std::cmp::Reverse(leaf.key));
-
-        let mut records = Vec::new();
-        let mut stop_key = None;
-        for leaf in leaves {
-            if let Some(stop_key) = stop_key {
-                // Folder names are second-granularity while `received_at` is
-                // not, so finish every folder sharing the second in which the
-                // limit was reached before stopping.
-                if leaf.key < stop_key {
-                    break;
-                }
-            }
-            for file in leaf.json_files {
-                let Ok(meta) = read_meta(&file).await else {
-                    continue;
-                };
-                if let Some(filter) = path_filter {
-                    if meta.path != filter
-                        && !meta
-                            .path
-                            .starts_with(&format!("{}/", filter.trim_end_matches('/')))
-                    {
-                        continue;
-                    }
-                }
-                let body_path = meta
-                    .body
-                    .object
-                    .as_ref()
-                    .and_then(|name| file.parent().map(|parent| parent.join(name)));
-                records.push(RequestRecord {
-                    meta,
-                    meta_path: file,
-                    body_path,
-                });
-            }
-            if stop_key.is_none() && records.len() >= limit {
-                stop_key = Some(leaf.key);
-            }
-        }
+        let recent = self.recent.read().await;
+        let mut records: Vec<_> = recent
+            .iter()
+            .rev()
+            .filter(|record| {
+                path_filter.is_none_or(|filter| path_matches_filter(&record.meta.path, filter))
+            })
+            .cloned()
+            .collect();
         records.sort_by(|a, b| {
             b.meta
                 .received_at
@@ -235,171 +200,167 @@ impl LocalStorage {
     }
 
     pub async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<RequestRecord>> {
-        let mut files = Vec::new();
-        collect_json_files(&self.root, &mut files).await?;
-        for file in files {
-            if file.file_stem().and_then(|s| s.to_str()) != Some(id) {
-                continue;
-            }
-            let Ok(meta) = read_meta(&file).await else {
-                continue;
-            };
-            let body_path = meta
-                .body
-                .object
-                .as_ref()
-                .and_then(|name| file.parent().map(|parent| parent.join(name)));
-            return Ok(Some(RequestRecord {
-                meta,
-                meta_path: file,
-                body_path,
-            }));
-        }
-        Ok(None)
+        Ok(self
+            .recent
+            .read()
+            .await
+            .iter()
+            .rev()
+            .find(|record| record.meta.id == id)
+            .cloned())
     }
 
     pub async fn dashboard(&self) -> anyhow::Result<DashboardStats> {
-        Ok(self.stats.read().await.snapshot())
+        let mut stats = self.stats.write().await;
+        stats.prune_paths(SystemTime::now());
+
+        Ok(DashboardStats {
+            total_requests: stats.total_requests,
+            complete_requests: stats.complete_requests,
+            incomplete_requests: stats.incomplete_requests,
+            stored_body_bytes: stats.stored_body_bytes,
+            top_paths: sorted_counts(
+                stats
+                    .paths
+                    .iter()
+                    .map(|(path, path_stats)| (path.clone(), path_stats.count))
+                    .collect(),
+                20,
+            ),
+            top_methods: sorted_counts(stats.methods.clone(), 8),
+        })
     }
 
     pub async fn cleanup_expired(&self, config: &config::Config) -> anyhow::Result<()> {
         let now = SystemTime::now();
         let grace = config.retention.prune_grace;
+        self.cleanup_dir(self.root.clone(), config, now, grace, true)
+            .await
+    }
 
-        let mut files = Vec::new();
-        let mut dirs = Vec::new();
-        collect_entries(&self.root, &mut files, &mut dirs).await?;
+    fn cleanup_dir<'a>(
+        &'a self,
+        dir: PathBuf,
+        config: &'a config::Config,
+        now: SystemTime,
+        grace: Duration,
+        is_root: bool,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let expires_at_path = dir.join(EXPIRES_AT_FILE);
+            let has_expires_at = fs::try_exists(&expires_at_path).await.unwrap_or(false);
 
-        let (expires_at_files, other_files): (Vec<_>, Vec<_>) = files
-            .into_iter()
-            .partition(|path| path.file_name().and_then(|n| n.to_str()) == Some(EXPIRES_AT_FILE));
-        let expires_at_dirs: std::collections::HashSet<PathBuf> = expires_at_files
-            .iter()
-            .filter_map(|path| path.parent().map(Path::to_path_buf))
-            .collect();
-
-        // Pass 1: delete expired leaf folders using the folder-level expiry
-        // marker written at capture time. This avoids opening every metadata
-        // JSON during routine cleanup.
-        for file in &expires_at_files {
-            let Ok(expires_at) = read_expires_at(file).await else {
-                continue;
-            };
-            if expires_at > now {
-                continue;
+            if !is_root {
+                if let Ok(expires_at) = read_expires_at(&expires_at_path).await {
+                    if expires_at <= now {
+                        let _guard = self.dir_lock.write().await;
+                        let _ = fs::remove_dir_all(&dir).await;
+                        return Ok(());
+                    }
+                }
             }
-            let Some(folder) = file.parent() else {
-                continue;
+
+            let Ok(mut entries) = fs::read_dir(&dir).await else {
+                return Ok(());
             };
-            if folder == self.root {
-                continue;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                match entry.file_type().await {
+                    Ok(file_type) if file_type.is_dir() => {
+                        self.cleanup_dir(path, config, now, grace, false).await?;
+                    }
+                    Ok(_) => {
+                        self.cleanup_file(&path, config, now, grace, has_expires_at)
+                            .await;
+                    }
+                    Err(_) => continue,
+                }
             }
-            let _guard = self.dir_lock.write().await;
-            let _ = fs::remove_dir_all(folder).await;
-            drop(_guard);
-            self.prune_dir_chain(folder.parent()).await;
+
+            if !is_root && is_older_than(&dir, grace).await {
+                let _guard = self.dir_lock.write().await;
+                if dir_is_empty(&dir).await {
+                    let _ = fs::remove_dir(&dir).await;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    async fn cleanup_file(
+        &self,
+        file: &Path,
+        config: &config::Config,
+        now: SystemTime,
+        grace: Duration,
+        parent_has_expires_at: bool,
+    ) {
+        if file.file_name().and_then(|n| n.to_str()) == Some(EXPIRES_AT_FILE) {
+            return;
         }
 
-        // Pass 2: migrate cleanup behavior for legacy markerless records.
-        // New folders have `.expires_at`, so routine cleanup does not open
-        // each metadata JSON.
-        for file in other_files.iter().filter(|path| {
-            path.extension().and_then(|e| e.to_str()) == Some("json")
-                && path
-                    .parent()
-                    .map(|parent| !expires_at_dirs.contains(parent))
-                    .unwrap_or(false)
-        }) {
+        if file.extension().and_then(|e| e.to_str()) == Some("json") && !parent_has_expires_at {
             let Ok(meta) = read_meta(file).await else {
-                continue;
+                return;
             };
             let ttl = config.rule_for_path(&meta.path).ttl;
             let age = now
                 .duration_since(meta.received_at.into())
                 .unwrap_or(Duration::ZERO);
-            if age < ttl {
-                continue;
-            }
-
-            if let Some(body) = &meta.body.object {
-                if let Some(parent) = file.parent() {
-                    let _ = fs::remove_file(parent.join(body)).await;
+            if age >= ttl {
+                if let Some(body) = &meta.body.object {
+                    if let Some(parent) = file.parent() {
+                        let _ = fs::remove_file(parent.join(body)).await;
+                    }
                 }
-            }
-            let _ = fs::remove_file(file).await;
-            self.prune_dir_chain(file.parent()).await;
-        }
-
-        // Pass 3: delete orphans — stale meta tmp files (crash between create
-        // and rename) and body files whose meta was never written. The grace
-        // period keeps in-flight writes safe: an active body stream refreshes
-        // its file mtime on every chunk.
-        for file in &other_files {
-            if !is_older_than(file, grace).await {
-                continue;
-            }
-            let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let orphan = if name.ends_with(".json.tmp")
-                || (name.starts_with(".expires_at.") && name.ends_with(".tmp"))
-            {
-                true
-            } else if let Some(id) = name
-                .strip_suffix(".body.bin.gz")
-                .or_else(|| name.strip_suffix(".body.bin"))
-            {
-                let meta = file.with_file_name(format!("{id}.json"));
-                // Keep the body file if the meta check itself fails.
-                !fs::try_exists(&meta).await.unwrap_or(true)
-            } else {
-                false
-            };
-            if orphan {
                 let _ = fs::remove_file(file).await;
             }
+            return;
         }
 
-        // Pass 4: sweep empty folders, deepest first. Only folders whose
-        // mtime is past the grace period are considered — writers only ever
-        // create entries in the folder for the current time window, so an
-        // old-mtime empty folder cannot be an active write target. The
-        // exclusive lock closes the remaining window against a writer that is
-        // mid-create.
-        dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
-        for dir in dirs {
-            if dir == self.root || !is_older_than(&dir, grace).await {
-                continue;
-            }
-            let _guard = self.dir_lock.write().await;
-            if dir_is_empty(&dir).await {
-                let _ = fs::remove_dir(&dir).await;
-            }
+        if !is_older_than(file, grace).await {
+            return;
         }
-        Ok(())
-    }
-
-    /// Removes `start` and its ancestors (up to, excluding, the root) while
-    /// they are empty. Holds the directory lock exclusively so no writer can
-    /// be mid-create inside a folder we are checking.
-    async fn prune_dir_chain(&self, start: Option<&Path>) {
-        let Some(mut current) = start.map(Path::to_path_buf) else {
+        let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
             return;
         };
-        let _guard = self.dir_lock.write().await;
-        while current.starts_with(&self.root) && current != self.root {
-            if !dir_is_empty(&current).await || fs::remove_dir(&current).await.is_err() {
-                break;
-            }
-            match current.parent() {
-                Some(parent) => current = parent.to_path_buf(),
-                None => break,
-            }
+        let orphan = if name.ends_with(".json.tmp")
+            || (name.starts_with(".expires_at.") && name.ends_with(".tmp"))
+        {
+            true
+        } else if let Some(id) = name
+            .strip_suffix(".body.bin.gz")
+            .or_else(|| name.strip_suffix(".body.bin"))
+        {
+            let meta = file.with_file_name(format!("{id}.json"));
+            !fs::try_exists(&meta).await.unwrap_or(true)
+        } else {
+            false
+        };
+        if orphan {
+            let _ = fs::remove_file(file).await;
+        }
+    }
+
+    async fn record_capture(&self, paths: &StoredRequestPaths, meta: &RequestMeta) {
+        self.record_stats(meta).await;
+
+        let mut recent = self.recent.write().await;
+        recent.push_back(RequestRecord {
+            meta: meta.clone(),
+            meta_path: paths.meta_path.clone(),
+            body_path: paths.body_path.clone(),
+        });
+        while recent.len() > RECENT_REQUEST_LIMIT {
+            recent.pop_front();
         }
     }
 
     async fn record_stats(&self, meta: &RequestMeta) {
         let mut stats = self.stats.write().await;
+        let received_at = meta.received_at.into();
+        stats.prune_paths(received_at);
+
         stats.total_requests += 1;
         if meta.body.complete {
             stats.complete_requests += 1;
@@ -409,7 +370,12 @@ impl LocalStorage {
         stats.stored_body_bytes = stats
             .stored_body_bytes
             .saturating_add(meta.body.stored_size);
-        *stats.paths.entry(meta.path.clone()).or_default() += 1;
+        let path_stats = stats.paths.entry(meta.path.clone()).or_insert(PathStats {
+            count: 0,
+            last_seen: received_at,
+        });
+        path_stats.count += 1;
+        path_stats.last_seen = received_at;
         *stats.methods.entry(meta.method.clone()).or_default() += 1;
     }
 
@@ -423,6 +389,7 @@ impl LocalStorage {
             return Ok(());
         };
         let path = parent.join(EXPIRES_AT_FILE);
+        let _guard = self.dir_lock.write().await;
         let existing = read_expires_at(&path).await.ok();
         let expires_at = existing
             .map(|old| old.max(expires_at))
@@ -430,7 +397,6 @@ impl LocalStorage {
         let value = epoch_seconds(expires_at).to_string();
         let tmp = parent.join(format!(".expires_at.{}.tmp", meta.id));
 
-        let _guard = self.dir_lock.read().await;
         fs::write(&tmp, value).await?;
         fs::rename(&tmp, &path).await?;
         Ok(())
@@ -438,14 +404,27 @@ impl LocalStorage {
 }
 
 impl StatsAccumulator {
-    fn snapshot(&self) -> DashboardStats {
-        DashboardStats {
-            total_requests: self.total_requests,
-            complete_requests: self.complete_requests,
-            incomplete_requests: self.incomplete_requests,
-            stored_body_bytes: self.stored_body_bytes,
-            top_paths: sorted_counts(self.paths.clone(), 8),
-            top_methods: sorted_counts(self.methods.clone(), 8),
+    fn prune_paths(&mut self, now: SystemTime) {
+        self.paths.retain(|_, stats| {
+            now.duration_since(stats.last_seen)
+                .map(|age| age < PATH_STATS_IDLE_TTL)
+                .unwrap_or(true)
+        });
+        if self.paths.len() <= PATH_STATS_LIMIT {
+            return;
+        }
+
+        let mut oldest: Vec<_> = self
+            .paths
+            .iter()
+            .map(|(path, stats)| (path.clone(), stats.last_seen))
+            .collect();
+        oldest.sort_by_key(|(_, last_seen)| *last_seen);
+        for (path, _) in oldest
+            .into_iter()
+            .take(self.paths.len().saturating_sub(PATH_STATS_PRUNE_TARGET))
+        {
+            self.paths.remove(&path);
         }
     }
 }
@@ -475,103 +454,6 @@ async fn read_expires_at(path: &Path) -> anyhow::Result<SystemTime> {
         .parse::<u64>()
         .with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(UNIX_EPOCH + Duration::from_secs(seconds))
-}
-
-async fn collect_json_files(root: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    let mut files = Vec::new();
-    let mut dirs = Vec::new();
-    collect_entries(root, &mut files, &mut dirs).await?;
-    out.extend(
-        files
-            .into_iter()
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json")),
-    );
-    Ok(())
-}
-
-/// A per-second leaf folder holding metadata JSON files, keyed by the
-/// timestamp encoded in its trailing `YYYY/MM/DD/HH/MM/SS` components.
-struct LeafTimeDir {
-    key: (i32, u32, u32, u32, u32, u32),
-    json_files: Vec<PathBuf>,
-}
-
-async fn collect_leaf_time_dirs(root: &Path) -> anyhow::Result<Vec<LeafTimeDir>> {
-    let mut leaves = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(mut entries) = fs::read_dir(&dir).await else {
-            continue;
-        };
-        let mut json_files = Vec::new();
-        // Entries can vanish mid-scan (retention races a request burst), so
-        // tolerate per-entry errors instead of aborting the walk.
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            match entry.file_type().await {
-                Ok(file_type) if file_type.is_dir() => stack.push(path),
-                Ok(_) if path.extension().and_then(|e| e.to_str()) == Some("json") => {
-                    json_files.push(path);
-                }
-                _ => {}
-            }
-        }
-        if !json_files.is_empty() {
-            leaves.push(LeafTimeDir {
-                key: leaf_time_key(&dir),
-                json_files,
-            });
-        }
-    }
-    Ok(leaves)
-}
-
-/// Metadata JSON files only ever live in the per-second folder, so the leaf's
-/// last six path components are its timestamp regardless of what the request
-/// path segments above them look like. Unparsable folders sort oldest so they
-/// are only read when the limit has not been reached.
-fn leaf_time_key(dir: &Path) -> (i32, u32, u32, u32, u32, u32) {
-    fn parse<T: std::str::FromStr>(component: Option<&std::ffi::OsStr>) -> Option<T> {
-        component?.to_str()?.parse().ok()
-    }
-    let mut components = dir.iter().rev();
-    let second = parse(components.next());
-    let minute = parse(components.next());
-    let hour = parse(components.next());
-    let day = parse(components.next());
-    let month = parse(components.next());
-    let year = parse(components.next());
-    match (year, month, day, hour, minute, second) {
-        (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) => (y, mo, d, h, mi, s),
-        _ => (i32::MIN, 0, 0, 0, 0, 0),
-    }
-}
-
-async fn collect_entries(
-    root: &Path,
-    files: &mut Vec<PathBuf>,
-    dirs: &mut Vec<PathBuf>,
-) -> anyhow::Result<()> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(mut entries) = fs::read_dir(&dir).await else {
-            continue;
-        };
-        // Entries can vanish mid-scan (retention races a request burst), so
-        // tolerate per-entry errors instead of aborting the walk.
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            match entry.file_type().await {
-                Ok(file_type) if file_type.is_dir() => {
-                    dirs.push(path.clone());
-                    stack.push(path);
-                }
-                Ok(_) => files.push(path),
-                Err(_) => continue,
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn is_older_than(path: &Path, grace: Duration) -> bool {
@@ -668,14 +550,15 @@ fn epoch_seconds(time: SystemTime) -> u64 {
         .as_secs()
 }
 
-fn sorted_counts(
-    map: std::collections::BTreeMap<String, usize>,
-    limit: usize,
-) -> Vec<(String, usize)> {
+fn sorted_counts(map: BTreeMap<String, usize>, limit: usize) -> Vec<(String, usize)> {
     let mut values: Vec<_> = map.into_iter().collect();
     values.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     values.truncate(limit);
     values
+}
+
+fn path_matches_filter(path: &str, filter: &str) -> bool {
+    path == filter || path.starts_with(&format!("{}/", filter.trim_end_matches('/')))
 }
 
 #[cfg(test)]
@@ -744,7 +627,11 @@ mod tests {
             let mut meta = test_meta(&id, path, None);
             meta.received_at = received_at;
             storage
-                .write_meta_with_expiry(&paths, &meta, SystemTime::now() + Duration::from_secs(3600))
+                .write_meta_with_expiry(
+                    &paths,
+                    &meta,
+                    SystemTime::now() + Duration::from_secs(3600),
+                )
                 .await
                 .unwrap();
         }
@@ -759,6 +646,124 @@ mod tests {
 
         let records = storage.recent(10, Some("/missing")).await.unwrap();
         assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recent_records_are_bounded_and_id_lookup_uses_the_ring_buffer() {
+        let tmp = TempDir::new().unwrap();
+        let storage = LocalStorage::new(tmp.path().join("data"));
+        storage.ensure_root().await.unwrap();
+
+        let start = Local::now();
+        for i in 0..=RECENT_REQUEST_LIMIT {
+            let received_at = start + chrono::Duration::milliseconds(i as i64);
+            let id = format!("id{i}");
+            let paths =
+                storage.paths_for("/bounded", received_at, &id, config::BodyMode::MetadataOnly);
+            let mut meta = test_meta(&id, "/bounded", None);
+            meta.received_at = received_at;
+            storage
+                .write_meta_with_expiry(
+                    &paths,
+                    &meta,
+                    SystemTime::now() + Duration::from_secs(3600),
+                )
+                .await
+                .unwrap();
+        }
+
+        let records = storage
+            .recent(RECENT_REQUEST_LIMIT + 10, None)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), RECENT_REQUEST_LIMIT);
+        assert!(storage.find_by_id("id0").await.unwrap().is_none());
+        assert!(storage
+            .find_by_id(&format!("id{RECENT_REQUEST_LIMIT}"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn path_counts_evict_after_seven_idle_days_and_restart() {
+        let tmp = TempDir::new().unwrap();
+        let storage = LocalStorage::new(tmp.path().join("data"));
+        storage.ensure_root().await.unwrap();
+
+        let old = Local::now() - chrono::Duration::from_std(PATH_STATS_IDLE_TTL).unwrap();
+        for i in 0..3 {
+            let id = format!("old{i}");
+            let paths = storage.paths_for("/old-id-path", old, &id, config::BodyMode::MetadataOnly);
+            let mut meta = test_meta(&id, "/old-id-path", None);
+            meta.received_at = old;
+            storage
+                .write_meta_with_expiry(
+                    &paths,
+                    &meta,
+                    SystemTime::now() + Duration::from_secs(3600),
+                )
+                .await
+                .unwrap();
+        }
+
+        let id = "new1";
+        let paths = storage.paths_for(
+            "/new-path",
+            Local::now(),
+            id,
+            config::BodyMode::MetadataOnly,
+        );
+        let meta = test_meta(id, "/new-path", None);
+        storage
+            .write_meta_with_expiry(&paths, &meta, SystemTime::now() + Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        let stats = storage.dashboard().await.unwrap();
+        assert_eq!(stats.top_paths, vec![("/new-path".to_string(), 1)]);
+
+        let id = "old-returned";
+        let paths = storage.paths_for(
+            "/old-id-path",
+            Local::now(),
+            id,
+            config::BodyMode::MetadataOnly,
+        );
+        let meta = test_meta(id, "/old-id-path", None);
+        storage
+            .write_meta_with_expiry(&paths, &meta, SystemTime::now() + Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        let stats = storage.dashboard().await.unwrap();
+        assert!(stats
+            .top_paths
+            .iter()
+            .any(|(path, count)| path == "/old-id-path" && *count == 1));
+    }
+
+    #[test]
+    fn path_stats_cap_prunes_least_recent_paths() {
+        let mut stats = StatsAccumulator::default();
+        let start = SystemTime::now();
+        for i in 0..=PATH_STATS_LIMIT {
+            stats.paths.insert(
+                format!("/path/{i}"),
+                PathStats {
+                    count: 1,
+                    last_seen: start + Duration::from_secs(i as u64),
+                },
+            );
+        }
+
+        stats.prune_paths(start + Duration::from_secs(PATH_STATS_LIMIT as u64));
+
+        assert_eq!(stats.paths.len(), PATH_STATS_PRUNE_TARGET);
+        assert!(!stats.paths.contains_key("/path/0"));
+        assert!(stats
+            .paths
+            .contains_key(&format!("/path/{PATH_STATS_LIMIT}")));
     }
 
     #[tokio::test]
@@ -790,6 +795,42 @@ mod tests {
             entries.next_entry().await.unwrap().is_none(),
             "expired record folders should be pruned to the storage root"
         );
+    }
+
+    #[tokio::test]
+    async fn expires_at_marker_keeps_latest_expiry_in_shared_folder() {
+        let tmp = TempDir::new().unwrap();
+        let storage = LocalStorage::new(tmp.path().join("data"));
+        storage.ensure_root().await.unwrap();
+
+        let received_at = Local::now();
+        let first = storage.paths_for(
+            "/same-second",
+            received_at,
+            "id1",
+            config::BodyMode::MetadataOnly,
+        );
+        let second = storage.paths_for(
+            "/same-second",
+            received_at,
+            "id2",
+            config::BodyMode::MetadataOnly,
+        );
+        let earlier = SystemTime::now() + Duration::from_secs(60);
+        let later = SystemTime::now() + Duration::from_secs(600);
+
+        storage
+            .write_meta_with_expiry(&first, &test_meta("id1", "/same-second", None), later)
+            .await
+            .unwrap();
+        storage
+            .write_meta_with_expiry(&second, &test_meta("id2", "/same-second", None), earlier)
+            .await
+            .unwrap();
+
+        let marker = first.meta_path.parent().unwrap().join(EXPIRES_AT_FILE);
+        let stored = read_expires_at(&marker).await.unwrap();
+        assert_eq!(epoch_seconds(stored), epoch_seconds(later));
     }
 
     #[tokio::test]

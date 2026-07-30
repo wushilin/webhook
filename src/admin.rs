@@ -283,7 +283,7 @@ async fn dashboard(state: AppState) -> Response {
 </section>
 <section class="grid">
   <div class="card">
-    <h2>Top paths</h2>
+    <h2>Top 20 active paths (7d idle TTL, 5k cap)</h2>
     <table><thead><tr><th>Path</th><th class="num">Requests</th></tr></thead><tbody>{}</tbody></table>
   </div>
   <div class="card">

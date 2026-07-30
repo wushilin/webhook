@@ -12,7 +12,7 @@ Useful for debugging third-party webhook integrations, inspecting what a client 
 - **Path/time-partitioned storage layout** — records are laid out by request path and timestamp for easy `find`/`grep`.
 - **TTL-based retention** — captures write folder-level expiry markers; a background worker deletes expired folders, orphaned files, and empty folders on a schedule.
 - **Configurable responses** — global and per-path-prefix response status, headers, and body (capture metadata JSON, static text, or static JSON).
-- **Admin UI** — dashboard, request list with path filtering, and request detail pages with body preview, protected by an optional login (bcrypt password, in-memory sessions).
+- **Admin UI** — dashboard, bounded recent-request list with path filtering, and request detail pages with body preview, protected by an optional login (bcrypt password, in-memory sessions).
 - **Safe filesystem mapping** — URL path segments are reversibly percent-encoded for filesystem use; the original path is always preserved verbatim in metadata.
 
 ## Quick start
@@ -160,7 +160,7 @@ Durations use [humantime](https://docs.rs/humantime) syntax (`30d`, `1h`, `15m`,
 | `username` | `admin` | Admin login username |
 | `password` | *(unset)* | bcrypt hash (recommended) or plaintext. When unset, the admin UI is **open** and a warning is logged at startup |
 
-Sessions last 24 hours and are kept in memory — restarting the server signs everyone out.
+Sessions and the recent-request browser are kept in memory — restarting the server signs everyone out and starts a new recent-request view.
 
 Generate a password hash:
 
@@ -262,7 +262,7 @@ The body file is written as a stream. If a client disconnects mid-body or an unk
 
 ## Retention and cleanup
 
-At capture time, the server resolves the path rule, applies `max(rule_ttl, min_ttl)`, and writes a `.expires_at` marker into the second-level capture folder. Every `cleanup_interval`, cleanup deletes folders whose marker is expired without opening each metadata JSON. It separately sweeps garbage such as stale `*.json.tmp`, stale `.expires_at.*.tmp`, body files whose metadata was never written, and empty folders; that garbage sweep only touches files and folders untouched for `prune_grace`.
+At capture time, the server resolves the path rule, applies `max(rule_ttl, min_ttl)`, and writes a `.expires_at` marker into the second-level capture folder. Every `cleanup_interval`, cleanup streams through the storage tree, deletes folders whose marker is expired without opening each metadata JSON, and prunes empty parent folders after their children are gone. It separately sweeps garbage such as stale `*.json.tmp`, stale `.expires_at.*.tmp`, and body files whose metadata was never written; that garbage sweep only touches files and folders untouched for `prune_grace`.
 
 ## Admin UI
 
@@ -270,9 +270,9 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 
 | Route | Description |
 |---|---|
-| `/_wh_admin/` | Dashboard with in-memory stats since process start |
-| `/_wh_admin/requests` | Recent requests, filterable by path |
-| `/_wh_admin/requests/<id>` | Request detail with headers and body preview |
+| `/_wh_admin/` | Dashboard with in-memory counters since process start and top 20 active paths; per-path counts evict after 7 days without a hit or when the 5k active-path cap is exceeded, then restart from 1 when seen again |
+| `/_wh_admin/requests` | Last 5000 requests since process start, filterable by path |
+| `/_wh_admin/requests/<id>` | Request detail with headers and body preview for requests still in the recent-request buffer |
 | `/_wh_admin/login`, `/logout` | Session login/logout (only when `admin.password` is set) |
 
 Paths that merely resemble the admin prefix (e.g. `/_wh_adminfoo`) are still captured as webhooks.
