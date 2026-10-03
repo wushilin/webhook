@@ -156,7 +156,12 @@ async fn shutdown_signal() {
 }
 
 async fn retention_worker(state: AppState) {
-    let mut interval = tokio::time::interval(state.config.retention.cleanup_interval);
+    let interval_period = state
+        .config
+        .retention
+        .cleanup_interval
+        .max(std::time::Duration::from_secs(1));
+    let mut interval = tokio::time::interval(interval_period);
     loop {
         interval.tick().await;
         if let Err(err) = state.storage.cleanup_expired(&state.config).await {

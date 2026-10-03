@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build and package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo build --locked --release --target "$TARGET"
+          mkdir -p staging
+          if [[ "$TARGET" == *windows* ]]; then
+            cp "target/$TARGET/release/webhook.exe" staging/
+          else
+            cp "target/$TARGET/release/webhook" staging/
+          fi
+          cp README.md config.example.toml LICENSE staging/
+          tar -czf "webhook-$RELEASE_TAG-$TARGET.tar.gz" -C staging .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: webhook-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  build-freebsd:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-freebsd
+            arch: x86_64
+          - target: aarch64-unknown-freebsd
+            arch: aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and package in FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          arch: ${{ matrix.arch }}
+          usesh: true
+          sync: rsync
+          copyback: true
+          run: |
+            pkg install -y rust
+            cargo build --locked --release --target ${{ matrix.target }}
+            mkdir -p staging
+            cp target/${{ matrix.target }}/release/webhook staging/
+            cp README.md config.example.toml LICENSE staging/
+            tar -czf webhook-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz -C staging .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: webhook-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [build, build-freebsd]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release-assets/*.tar.gz

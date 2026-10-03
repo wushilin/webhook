@@ -77,6 +77,14 @@ Run options:
 
 Logging is JSON via `tracing`, controlled with `RUST_LOG` (e.g. `RUST_LOG=info`).
 
+## Releases
+
+Tagged versions are built for Linux, macOS, Windows, and FreeBSD on x86_64 and
+ARM64. Download the archive matching your platform from the
+[GitHub Releases page](https://github.com/wushilin/webhook/releases). Archives
+are named `webhook-<version>-<target>.tar.gz` and include the executable, this
+README, the example config, and the license.
+
 ## Configuration
 
 Configuration is TOML. Every section and key is optional — missing keys use the defaults shown below. Generate a default file with `webhook genconfig > config.toml`, or see [`config.example.toml`](config.example.toml) for a complete working example with sample path rules.
