@@ -68,8 +68,6 @@ jobs:
         include:
           - target: x86_64-unknown-freebsd
             arch: x86_64
-          - target: aarch64-unknown-freebsd
-            arch: aarch64
 
     steps:
       - uses: actions/checkout@v4
@@ -94,6 +92,38 @@ jobs:
         with:
           name: ${{ matrix.target }}
           path: webhook-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  build-freebsd-aarch64:
+    name: Build aarch64-unknown-freebsd
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-freebsd
+
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-unknown-freebsd@14
+
+      - name: Build and package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo build --locked --release --target aarch64-unknown-freebsd
+          mkdir -p staging
+          cp target/aarch64-unknown-freebsd/release/webhook staging/
+          cp README.md config.example.toml LICENSE staging/
+          tar -czf "webhook-$RELEASE_TAG-aarch64-unknown-freebsd.tar.gz" -C staging .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-unknown-freebsd
+          path: webhook-${{ github.ref_name }}-aarch64-unknown-freebsd.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -139,7 +169,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
-    needs: [build, build-freebsd, build-linux-musl]
+    needs: [build, build-freebsd, build-freebsd-aarch64, build-linux-musl]
     steps:
       - uses: actions/download-artifact@v4
         with:
