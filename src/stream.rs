@@ -1,6 +1,6 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 use axum::{
@@ -12,14 +12,17 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use base64::Engine;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use named_queue::{QueueRegistry, Receiver, Sender};
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use crate::{admin, config, models::RequestMeta, AppState};
 
 const QUEUE_NAME: &str = "requests";
+const BODY_FILE_SUFFIXES: [&str; 2] = [".body.bin", ".body.bin.gz"];
 
 /// One captured request, serialized once and shared by every consumer.
 #[derive(Clone)]
@@ -32,13 +35,8 @@ pub struct StreamEvent {
 struct StreamPayload<'a> {
     #[serde(flatten)]
     meta: &'a RequestMeta,
-    /// Base64 of the original (uncompressed) body, at most
-    /// `stream.max_body_size` bytes of it; null only when nothing was captured.
-    body_base64: Option<String>,
-    /// Set when `body_base64` is not the whole body; `body_truncated_reason`
-    /// then says why.
-    body_truncated: bool,
-    body_truncated_reason: Option<&'static str>,
+    /// Where to fetch the stored body, or null when no body file was written.
+    body_url: Option<String>,
 }
 
 /// Broadcasting queue fan-out: every websocket consumer holds its own
@@ -46,24 +44,14 @@ struct StreamPayload<'a> {
 pub struct StreamHub {
     registry: QueueRegistry,
     sender: Sender<StreamEvent>,
-    consumers: Arc<AtomicUsize>,
-    max_body_size: u64,
-}
-
-/// Counts a connected consumer for as long as it lives.
-struct ConsumerGuard(Arc<AtomicUsize>);
-
-impl Drop for ConsumerGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
+    admin_prefix: String,
 }
 
 impl StreamHub {
-    pub fn new(config: &config::StreamConfig) -> anyhow::Result<Self> {
+    pub fn new(config: &config::Config) -> anyhow::Result<Self> {
         let registry = QueueRegistry::new();
         registry
-            .create_broadcasting::<StreamEvent>(QUEUE_NAME, config.buffer)
+            .create_broadcasting::<StreamEvent>(QUEUE_NAME, config.stream.buffer)
             .map_err(|err| anyhow::anyhow!("failed to create stream queue: {err:?}"))?;
         let sender = registry
             .acquire_sender::<StreamEvent>(QUEUE_NAME)
@@ -71,37 +59,17 @@ impl StreamHub {
         Ok(Self {
             registry,
             sender,
-            consumers: Arc::new(AtomicUsize::new(0)),
-            max_body_size: config.max_body_size,
+            admin_prefix: config.server.admin_prefix.trim_end_matches('/').to_string(),
         })
     }
 
-    /// Lets capture skip buffering bodies in memory when nobody is listening.
-    pub fn has_consumers(&self) -> bool {
-        self.consumers.load(Ordering::Relaxed) > 0
-    }
-
     /// Called once the request's body file and metadata have been written.
-    /// `body` is the in-memory copy of the first `stream.max_body_size` bytes
-    /// captured while the body was persisted.
-    pub fn publish(&self, meta: &RequestMeta, body: Option<&[u8]>) {
-        let truncated_reason = if meta.body.limit_exceeded {
-            Some("body exceeded max_body_size")
-        } else if meta.body.original_size > self.max_body_size {
-            Some("body too big for streaming")
-        } else if !meta.body.complete {
-            Some("body incomplete")
-        } else if body.is_none() {
-            // A consumer connected while this request's body was in flight.
-            Some("body not captured")
-        } else {
-            None
-        };
+    /// Events carry metadata only; `body_ref` (from [`body_ref`]) points at
+    /// the stored body for on-demand fetching.
+    pub fn publish(&self, meta: &RequestMeta, body_ref: Option<String>) {
         let payload = StreamPayload {
             meta,
-            body_base64: body.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
-            body_truncated: truncated_reason.is_some(),
-            body_truncated_reason: truncated_reason,
+            body_url: body_ref.map(|r| format!("{}/stream/body/{r}", self.admin_prefix)),
         };
         let json = match serde_json::to_string(&payload) {
             Ok(json) => json,
@@ -117,10 +85,8 @@ impl StreamHub {
         });
     }
 
-    fn subscribe(&self) -> Option<(Receiver<StreamEvent>, ConsumerGuard)> {
-        let rx = self.registry.acquire_receiver(QUEUE_NAME).ok()?;
-        self.consumers.fetch_add(1, Ordering::Relaxed);
-        Some((rx, ConsumerGuard(self.consumers.clone())))
+    fn subscribe(&self) -> Option<Receiver<StreamEvent>> {
+        self.registry.acquire_receiver(QUEUE_NAME).ok()
     }
 
     /// Closes the queue so open websockets end and do not hold up shutdown.
@@ -129,15 +95,43 @@ impl StreamHub {
     }
 }
 
-pub async fn handle(state: AppState, req: Request<Body>) -> Response {
-    let hub = state.stream.clone();
+/// URL-safe reference to a body file: its path relative to the storage root.
+pub fn body_ref(root: &Path, body_path: &Path) -> Option<String> {
+    let relative = body_path.strip_prefix(root).ok()?;
+    Some(URL_SAFE_NO_PAD.encode(relative.to_str()?))
+}
 
+/// Inverse of [`body_ref`]. Accepts only plain relative paths that name a
+/// body file, so a reference can never reach outside the storage root.
+fn decode_body_ref(encoded: &str) -> Option<PathBuf> {
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    let relative = PathBuf::from(String::from_utf8(bytes).ok()?);
+    let plain = relative.components().count() > 0
+        && relative
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+    let file_name = relative.file_name()?.to_str()?;
+    let body_file = BODY_FILE_SUFFIXES
+        .iter()
+        .any(|suffix| file_name.len() > suffix.len() && file_name.ends_with(suffix));
+    (plain && body_file).then_some(relative)
+}
+
+/// Token check shared by the websocket and the body endpoint; with no
+/// `stream.token` configured everything is allowed.
+fn authorize(state: &AppState, headers: &HeaderMap, query: &[(String, String)]) -> bool {
+    let Some(expected) = state.config.stream.token.as_deref() else {
+        return true;
+    };
+    bearer_token(headers)
+        .or_else(|| admin::form_value(query, "token"))
+        .is_some_and(|t| admin::constant_time_eq(t.as_bytes(), expected.as_bytes()))
+}
+
+pub async fn handle(state: AppState, req: Request<Body>) -> Response {
     let query = req.uri().query().map(admin::parse_form).unwrap_or_default();
-    if let Some(expected) = state.config.stream.token.as_deref() {
-        let token = bearer_token(req.headers()).or_else(|| admin::form_value(&query, "token"));
-        if !token.is_some_and(|t| admin::constant_time_eq(t.as_bytes(), expected.as_bytes())) {
-            return (StatusCode::UNAUTHORIZED, "invalid stream token\n").into_response();
-        }
+    if !authorize(&state, req.headers(), &query) {
+        return (StatusCode::UNAUTHORIZED, "invalid stream token\n").into_response();
     }
     let prefix = admin::form_value(&query, "prefix").and_then(|p| normalize_prefix(&p));
 
@@ -146,13 +140,57 @@ pub async fn handle(state: AppState, req: Request<Body>) -> Response {
         Ok(ws) => ws,
         Err(rejection) => return rejection.into_response(),
     };
-    let Some((rx, guard)) = hub.subscribe() else {
+    let Some(rx) = state.stream.subscribe() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "stream is shutting down\n").into_response();
     };
-    ws.on_upgrade(move |socket| async move {
-        consume(socket, rx, prefix).await;
-        drop(guard);
-    })
+    ws.on_upgrade(move |socket| consume(socket, rx, prefix))
+}
+
+/// Streams a stored body from disk, gunzipped, optionally cut to `?limit=N`
+/// bytes. Served as an inert download so a captured HTML or script body can
+/// never run on the admin origin.
+pub async fn body(state: AppState, req: Request<Body>, encoded: &str) -> Response {
+    let query = req.uri().query().map(admin::parse_form).unwrap_or_default();
+    if !authorize(&state, req.headers(), &query) {
+        return (StatusCode::UNAUTHORIZED, "invalid stream token\n").into_response();
+    }
+    let Some(relative) = decode_body_ref(encoded) else {
+        return (StatusCode::NOT_FOUND, "unknown body reference\n").into_response();
+    };
+    let limit = match admin::form_value(&query, "limit") {
+        None => u64::MAX,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(limit) => limit,
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid limit\n").into_response(),
+        },
+    };
+
+    let path = state.storage.root().join(&relative);
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, "body is no longer stored\n").into_response();
+        }
+        Err(err) => {
+            warn!(error = ?err, path = %path.display(), "failed to open body file");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to open body\n").into_response();
+        }
+    };
+    let reader: Box<dyn AsyncRead + Send + Unpin> = if path.extension() == Some("gz".as_ref()) {
+        Box::new(async_compression::tokio::bufread::GzipDecoder::new(
+            BufReader::new(file),
+        ))
+    } else {
+        Box::new(file)
+    };
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_SECURITY_POLICY, "sandbox")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(ReaderStream::new(reader.take(limit))))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// `asdf` and ` /asdf ` both mean `/asdf`; paths always start with `/`.
@@ -208,12 +246,30 @@ async fn consume(mut socket: WebSocket, rx: Receiver<StreamEvent>, prefix: Optio
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_prefix;
+    use super::*;
 
     #[test]
     fn prefix_gets_leading_slash_and_blank_means_all() {
         assert_eq!(normalize_prefix("/asdf").as_deref(), Some("/asdf"));
         assert_eq!(normalize_prefix(" asdf ").as_deref(), Some("/asdf"));
         assert_eq!(normalize_prefix("  "), None);
+    }
+
+    #[test]
+    fn body_ref_round_trips_and_rejects_escapes() {
+        let root = Path::new("./data");
+        let body = root.join("api/2026/10/12/22/00/45/45_1_host_x.body.bin.gz");
+        let encoded = body_ref(root, &body).unwrap();
+        assert_eq!(
+            decode_body_ref(&encoded).unwrap(),
+            PathBuf::from("api/2026/10/12/22/00/45/45_1_host_x.body.bin.gz")
+        );
+
+        let encode = |p: &str| URL_SAFE_NO_PAD.encode(p);
+        assert!(decode_body_ref(&encode("../etc/x.body.bin")).is_none());
+        assert!(decode_body_ref(&encode("/etc/x.body.bin")).is_none());
+        assert!(decode_body_ref(&encode("a/b/meta.json")).is_none());
+        assert!(decode_body_ref(&encode(".body.bin")).is_none());
+        assert!(decode_body_ref("not base64!").is_none());
     }
 }

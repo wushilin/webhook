@@ -121,7 +121,6 @@ max_body_size = "100MiB"       # requests with a larger body are rejected with 4
 [stream]
 token = "change-me"            # required by the websocket stream; unset = open stream
 buffer = 1024                  # events buffered per consumer before its oldest are dropped
-max_body_size = "5MiB"         # longer bodies are cut to this size and flagged truncated
 
 # Default response for successful captures
 [responder]
@@ -179,7 +178,6 @@ Durations use [humantime](https://docs.rs/humantime) syntax (`30d`, `1h`, `15m`,
 |---|---|---|
 | `token` | *(unset)* | Token required to open the request stream. When unset, the stream is **open** to anyone and a warning is logged at startup |
 | `buffer` | `1024` | Events buffered per consumer. A consumer that falls further behind loses its oldest events |
-| `max_body_size` | `5MiB` | At most this many body bytes are included in each stream event; a longer body is cut off and flagged with `body_truncated` |
 
 Sessions and the recent-request browser are kept in memory — restarting the server signs everyone out and starts a new recent-request view.
 
@@ -317,7 +315,7 @@ websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/str
 `/_wh_admin/streamview` shows the stream in the browser. Enter the stream token and an optional path prefix, and new requests appear on top as cards. Click a card to expand it and see:
 
 - **Summary:** size, content type and request id.
-- **Body:** pretty-printed JSON, a form field list, plain text, or a hex dump for binary bodies, with buttons to copy or download it.
+- **Body:** fetched from the body endpoint only when you expand the card, first 256KiB, with a **Load all** button for the rest. It's shown as pretty-printed JSON, a form field list, plain text, or a hex dump for binary bodies, with buttons to copy or download it.
 - **Headers and raw event:** every header, plus the raw JSON event.
 
 **Pause** only freezes the page. The WebSocket stays connected, and new requests wait in a banner until you resume. The page keeps the latest 500 cards and drops the oldest. It reconnects automatically if the connection drops.
@@ -326,12 +324,10 @@ The page itself is served without the admin login, because it holds no data; eve
 
 ### Message format
 
-- **One request, one message.** Each captured request is sent as exactly one WebSocket **text** message containing one UTF-8 JSON object. A request is never split across messages, and a message never holds more than one request. No other message types are sent.
-- **Ordering.** Messages arrive in the order the requests finished being captured. A message is sent only after that request's body file and metadata JSON have been written.
-- **Size.** A message can be up to about 4/3 × `stream.max_body_size` plus the metadata, because the body is base64-encoded. That is roughly 7MiB with the default 5MiB limit, so make sure your client accepts messages that large.
+- **One request, one message.** Each captured request is sent as exactly one WebSocket **text** message containing one UTF-8 JSON object: an envelope with the request metadata. **Bodies are never sent over the stream.** Fetch them from `body_url` when you need them, so a burst of large requests costs the stream almost nothing.
+- **Ordering.** Messages arrive in the order the requests finished being captured. A message is sent only after that request's body file and metadata JSON have been written, so `body_url` is ready to fetch as soon as the message arrives.
 - **Client to server.** Anything the client sends is ignored, apart from Close. Pings are answered automatically.
 - **Shutdown.** When the server shuts down, it sends a Close frame.
-- **All body modes.** Requests are streamed in every `body.mode`, including `metadata_only`.
 
 Message fields:
 
@@ -343,17 +339,8 @@ Message fields:
 | `path` | string | Request path, still percent-encoded as received |
 | `query` | string \| null | Raw query string without the `?` |
 | `headers` | object | Header name (lowercase) → string, or an array of strings when the header repeats |
-| `body` | object | Stored body metadata, the same as in the metadata JSON on disk: `stored`, `complete`, `mode`, `object`, `encoding`, `original_size`, `stored_size`, `content_type`, `previewable`, `limit_exceeded`, `error` |
-| `body_base64` | string \| null | Standard base64 (with padding) of the original, uncompressed body, at most `stream.max_body_size` bytes of it. An empty body is `""`. `null` only when no bytes were captured |
-| `body_truncated` | bool | `true` when `body_base64` is not the whole body |
-| `body_truncated_reason` | string \| null | Why the body was truncated (see below), or `null` |
-
-Truncation reasons:
-
-- `"body too big for streaming"`: the body is larger than `stream.max_body_size`, so only its first `stream.max_body_size` bytes are sent. `body.original_size` has the full size.
-- `"body exceeded max_body_size"`: the request went over the capture limit and got a 413. You get the bytes received before the cutoff, or `null` if it was rejected up front by `Content-Length`.
-- `"body incomplete"`: the client disconnected mid-body. You get the bytes that arrived.
-- `"body not captured"`: you connected while that request was still arriving, so `body_base64` is `null`.
+| `body` | object | Stored body metadata, the same as in the metadata JSON on disk: `stored`, `complete`, `mode`, `object`, `encoding`, `original_size` (bytes received), `stored_size` (bytes on disk), `content_type`, `previewable`, `limit_exceeded`, `error` |
+| `body_url` | string \| null | Path of the body endpoint for this request. `null` when no body file was written, for example in `metadata_only` mode or when the request was rejected up front by `Content-Length` |
 
 Example (formatted here for readability; on the wire it is a single line):
 
@@ -372,10 +359,22 @@ Example (formatted here for readability; on the wire it is a single line):
     "content_type": "application/json", "previewable": true,
     "limit_exceeded": false, "error": null
   },
-  "body_base64": "eyJoZWxsbyI6MX0=",
-  "body_truncated": false,
-  "body_truncated_reason": null
+  "body_url": "/_wh_admin/stream/body/YXBpL3YxL2hvb2svMjAyNi8xMC8xMi8wOS8xNS8wNy8wN18xMjM0NTY3ODlfbXlob3N0X0FiQ2RFZkdoSWpLbE1uT3AuYm9keS5iaW4uZ3o"
 }
+```
+
+### Fetching a body
+
+`GET <body_url>` returns the original, uncompressed body as stored on disk. It uses the same token rules as the stream (`Authorization: Bearer <token>` or `?token=`).
+
+- **Reference:** the last part of `body_url` is the body file's location under `storage.root`, base64url-encoded. It works for as long as the request is retained (`retention.default_ttl`), not only while it's in the live stream. The server rejects any reference that would point outside the storage root.
+- **`?limit=N`:** returns only the first N bytes of the body. Without it you get the whole body, streamed from disk and gunzipped on the fly, so even large bodies aren't buffered in memory.
+- **Response:** always `application/octet-stream` with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so a captured HTML or script body can never run on the admin origin. Use `body.content_type` from the envelope for the original type.
+- **Errors:** 401 for a missing or wrong token, 404 when the reference is invalid or the body has expired.
+- **Partial bodies:** for incomplete or limit-exceeded requests you get exactly what was stored, which can be shorter than `body.original_size`.
+
+```sh
+curl -H 'Authorization: Bearer change-me' "http://127.0.0.1:8080$BODY_URL?limit=1024"
 ```
 
 ## Development

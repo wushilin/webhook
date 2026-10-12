@@ -33,8 +33,7 @@
   const ADMIN_PREFIX = __ADMIN_PREFIX__;
   const TOKEN_REQUIRED = __TOKEN_REQUIRED__;
   const MAX_CARDS = 500;
-  const SNIPPET_B64_CHARS = 400; // 300 bytes
-  const DISPLAY_LIMIT = 512 * 1024;
+  const PREVIEW_BYTES = 256 * 1024; // fetched when a card is expanded
   const HEXDUMP_LIMIT = 64 * 1024;
 
   const $ = (id) => document.getElementById(id);
@@ -53,7 +52,7 @@
   };
 
   let ws = null, wanted = false, opened = false, retry = 0, retryTimer = null;
-  let activePrefix = "", prefixTimer = null;
+  let activePrefix = "", activeToken = "", prefixTimer = null;
   let paused = false, pending = [], dropped = 0, received = 0;
 
   // ?token=&prefix= prefill the form; the token is then stripped from the address bar.
@@ -90,6 +89,7 @@
     const sock = new WebSocket(streamUrl());
     ws = sock;
     activePrefix = currentPrefix();
+    activeToken = els.token.value.trim();
     opened = false;
     setStatus("connecting", "Connecting…");
     sock.onopen = () => {
@@ -258,17 +258,13 @@
     return card;
   }
 
+  /** Cards are built from the envelope alone; bodies are fetched on expand. */
   function snippet(ev) {
-    const size = (ev.body && ev.body.original_size) || 0;
-    if (ev.body_base64 == null) {
-      if (size === 0) return null;
-      return { text: "Body not streamed: " + (ev.body_truncated_reason || "unavailable"), muted: true };
-    }
-    if (ev.body_base64 === "") return null;
-    const bytes = b64ToBytes(ev.body_base64.slice(0, SNIPPET_B64_CHARS));
-    if (looksBinary(bytes)) return { text: `Binary body · ${humanBytes(size)}`, muted: true };
-    const text = new TextDecoder().decode(bytes).replace(/\s+/g, " ").trim();
-    return { text: text.slice(0, 240), muted: false };
+    const body = ev.body || {};
+    const size = body.original_size || 0;
+    if (size === 0) return null;
+    if (!ev.body_url) return { text: "Body not stored (metadata only)", muted: true };
+    return { text: body.content_type || "No content type", muted: true };
   }
 
   function buildDetail(ev) {
@@ -297,66 +293,113 @@
 
     const raw = el("details", "sv-raw");
     raw.append(el("summary", null, "Raw event"));
-    const rawEvent = Object.assign({}, ev);
-    if (typeof rawEvent.body_base64 === "string" && rawEvent.body_base64.length > 160) {
-      rawEvent.body_base64 = rawEvent.body_base64.slice(0, 160) + `… (${fmtInt(ev.body_base64.length)} chars)`;
-    }
-    raw.append(el("pre", null, JSON.stringify(rawEvent, null, 2)));
+    raw.append(el("pre", null, JSON.stringify(ev, null, 2)));
     detail.append(raw);
     return detail;
   }
 
   function bodySection(ev) {
     const body = ev.body || {};
+    const size = body.original_size || 0;
     const { section, heading, tools } = sectionEl("Body");
 
-    if (ev.body_truncated) {
-      const shown = ev.body_base64 == null ? 0 : b64Length(ev.body_base64);
-      const note = el("p", "sv-note",
-        `Truncated: ${ev.body_truncated_reason || "unknown reason"}` +
-        (ev.body_base64 == null ? "" : ` — showing ${humanBytes(shown)} of ${humanBytes(body.original_size || 0)}`));
-      section.append(note);
+    if (body.limit_exceeded) {
+      section.append(el("p", "sv-note", "Body exceeded max_body_size; only the part received before the cutoff was stored."));
+    } else if (!body.complete) {
+      section.append(el("p", "sv-note", "Body incomplete: the client disconnected mid-body; this is what was stored."));
     }
-    if (ev.body_base64 == null || ev.body_base64 === "") {
-      if (!ev.body_truncated) section.append(el("p", "muted", "Empty body."));
+    if (!ev.body_url) {
+      section.append(el("p", "muted", size === 0 ? "Empty body." : "No body was stored for this request (metadata_only mode)."));
+      return section;
+    }
+    if (size === 0 && body.complete) {
+      section.append(el("p", "muted", "Empty body."));
       return section;
     }
 
-    const bytes = b64ToBytes(ev.body_base64);
-    const view = renderBody(bytes, body.content_type || "");
-    heading.insertBefore(el("span", "sv-kind", view.kind), tools);
-
+    const kind = el("span", "sv-kind");
+    kind.hidden = true;
+    heading.insertBefore(kind, tools);
+    const info = el("p", "muted", "Loading body…");
     const pre = el("pre");
-    if (view.text.length > DISPLAY_LIMIT) {
-      pre.textContent = view.text.slice(0, DISPLAY_LIMIT);
-      const more = el("button", "secondary sv-more", `Show all (${humanBytes(view.text.length)})`);
-      more.type = "button";
-      more.addEventListener("click", () => { pre.textContent = view.text; more.remove(); });
-      section.append(pre, more);
-    } else {
-      pre.textContent = view.text;
-      section.append(pre);
-    }
+    pre.hidden = true;
+    section.append(info, pre);
 
-    const copy = el("button", "secondary", view.kind === "Binary" ? "Copy base64" : "Copy");
+    let loaded = null;
+    const loadAll = el("button", "secondary sv-more", "Load all");
+    loadAll.type = "button";
+    loadAll.addEventListener("click", () => {
+      loadAll.disabled = true;
+      loadAll.textContent = "Loading…";
+      fetchBody(ev.body_url).then((bytes) => render(bytes, true), fail);
+    });
+
+    function render(bytes, full) {
+      const complete = full || bytes.length < PREVIEW_BYTES;
+      const view = renderBody(bytes, body.content_type || "");
+      loaded = { bytes, view };
+      kind.textContent = view.kind;
+      kind.hidden = false;
+      pre.textContent = view.text;
+      pre.hidden = false;
+      if (complete) {
+        info.hidden = true;
+      } else {
+        info.className = "sv-partial";
+        info.replaceChildren(`Showing the first ${humanBytes(bytes.length)} of ${humanBytes(size)}. `, loadAll);
+      }
+    }
+    function fail(err) {
+      info.hidden = false;
+      info.className = "error";
+      info.textContent = err.message;
+    }
+    fetchBody(ev.body_url, PREVIEW_BYTES).then((bytes) => render(bytes, false), fail);
+
+    const copy = el("button", "secondary", "Copy");
     copy.type = "button";
-    copy.addEventListener("click", () =>
-      copyText(view.kind === "Binary" ? ev.body_base64 : view.raw, copy));
+    copy.addEventListener("click", () => {
+      if (!loaded) return;
+      copyText(loaded.view.kind === "Binary" ? bytesToB64(loaded.bytes) : loaded.view.raw, copy);
+    });
     const download = el("button", "secondary", "Download");
     download.type = "button";
-    download.addEventListener("click", () => {
-      const ext = view.kind === "JSON" ? ".json" : view.kind === "Binary" ? ".bin" : ".txt";
-      const url = URL.createObjectURL(new Blob([bytes], { type: body.content_type || "application/octet-stream" }));
-      const a = el("a");
-      a.href = url;
-      a.download = (ev.id || "body") + ext;
-      document.body.append(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    download.addEventListener("click", async () => {
+      download.disabled = true;
+      try {
+        const bytes = await fetchBody(ev.body_url);
+        const kindName = loaded ? loaded.view.kind : "";
+        const ext = kindName === "JSON" ? ".json" : kindName === "Binary" ? ".bin" : ".txt";
+        const url = URL.createObjectURL(new Blob([bytes], { type: body.content_type || "application/octet-stream" }));
+        const a = el("a");
+        a.href = url;
+        a.download = (ev.id || "body") + ext;
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (err) {
+        fail(err);
+      } finally {
+        download.disabled = false;
+      }
     });
     tools.append(copy, download);
     return section;
+  }
+
+  /** The body endpoint takes the same token as the stream this card came from. */
+  async function fetchBody(url, limit) {
+    const headers = activeToken ? { Authorization: "Bearer " + activeToken } : {};
+    const res = await fetch(url + (limit != null ? "?limit=" + limit : ""), { headers, cache: "no-store" });
+    if (!res.ok) {
+      throw new Error(res.status === 404
+        ? "Body is no longer stored (expired or cleaned up)."
+        : res.status === 401
+          ? "The stream token was rejected while fetching the body."
+          : `Fetching the body failed (HTTP ${res.status}).`);
+    }
+    return new Uint8Array(await res.arrayBuffer());
   }
 
   function renderBody(bytes, contentType) {
@@ -423,7 +466,6 @@
     const body = ev.body || {};
     if (body.limit_exceeded) return el("span", "pill warn", "⚠ limit exceeded");
     if (!body.complete) return el("span", "pill bad", "✗ incomplete");
-    if (ev.body_truncated) return el("span", "pill warn", "✂ truncated");
     return el("span", "pill ok", "✓ complete");
   }
 
@@ -436,16 +478,12 @@
     return node;
   }
 
-  function b64ToBytes(b64) {
-    const bin = atob(b64);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  }
-
-  function b64Length(b64) {
-    const pad = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
-    return (b64.length / 4) * 3 - pad;
+  function bytesToB64(bytes) {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
   }
 
   function looksBinary(bytes) {

@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     if config.stream.token.is_none() {
         warn!("stream.token is not configured; anyone can open the request stream");
     }
-    let stream = Arc::new(stream::StreamHub::new(&config.stream)?);
+    let stream = Arc::new(stream::StreamHub::new(&config)?);
 
     let state = AppState {
         config: config.clone(),
@@ -269,19 +269,7 @@ async fn capture_request_inner(state: AppState, req: Request<Body>) -> anyhow::R
     let paths = state
         .storage
         .paths_for(&path, received_at, &id, rule.body_mode);
-    let stream_limit = state
-        .stream
-        .has_consumers()
-        .then_some(state.config.stream.max_body_size);
-    let (body_meta, captured) = stream_body(
-        &state.storage,
-        req.into_body(),
-        &paths,
-        &headers,
-        &rule,
-        stream_limit,
-    )
-    .await;
+    let body_meta = stream_body(&state.storage, req.into_body(), &paths, &headers, &rule).await;
 
     let status = if body_meta.limit_exceeded {
         StatusCode::PAYLOAD_TOO_LARGE
@@ -309,7 +297,11 @@ async fn capture_request_inner(state: AppState, req: Request<Body>) -> anyhow::R
         .storage
         .write_meta_with_expiry(&paths, &meta, expires_at(received_at, rule.ttl))
         .await?;
-    state.stream.publish(&meta, captured.as_deref());
+    let body_ref = paths
+        .body_path()
+        .filter(|_| meta.body.stored)
+        .and_then(|body_path| stream::body_ref(state.storage.root(), body_path));
+    state.stream.publish(&meta, body_ref);
 
     if capture_response.success {
         let responder = state.config.responder_for_path(&path);
@@ -374,9 +366,7 @@ async fn stream_body(
     paths: &StoredRequestPaths,
     headers: &HeaderMap,
     rule: &config::ResolvedPathRule,
-    capture_limit: Option<u64>,
-) -> (BodyMeta, Option<Vec<u8>>) {
-    let mut capture = BodyCapture::new(capture_limit);
+) -> BodyMeta {
     if matches!(rule.body_mode, config::BodyMode::MetadataOnly) {
         let mut stream = body.into_data_stream();
         let mut original_size = 0u64;
@@ -388,7 +378,6 @@ async fn stream_body(
             match chunk {
                 Ok(bytes) => {
                     original_size = original_size.saturating_add(bytes.len() as u64);
-                    capture.push(&bytes);
                     if original_size > rule.max_body_size {
                         complete = false;
                         limit_exceeded = true;
@@ -407,7 +396,7 @@ async fn stream_body(
             }
         }
 
-        let meta = BodyMeta {
+        return BodyMeta {
             stored: false,
             complete,
             mode: rule.body_mode.to_string(),
@@ -420,13 +409,12 @@ async fn stream_body(
             limit_exceeded,
             error,
         };
-        return (meta, capture.into_inner());
     }
 
     let file = match storage.create_body_file(paths).await {
         Ok(file) => file,
         Err(err) => {
-            let meta = BodyMeta {
+            return BodyMeta {
                 stored: false,
                 complete: false,
                 mode: rule.body_mode.to_string(),
@@ -439,7 +427,6 @@ async fn stream_body(
                 limit_exceeded: false,
                 error: Some(format!("failed to create body file: {err}")),
             };
-            return (meta, None);
         }
     };
 
@@ -461,7 +448,6 @@ async fn stream_body(
         match chunk {
             Ok(bytes) => {
                 original_size = original_size.saturating_add(bytes.len() as u64);
-                capture.push(&bytes);
                 if original_size > rule.max_body_size {
                     complete = false;
                     limit_exceeded = true;
@@ -491,7 +477,7 @@ async fn stream_body(
     }
 
     let stored_size = paths.body_size().await.unwrap_or(0);
-    let meta = BodyMeta {
+    BodyMeta {
         stored: true,
         complete,
         mode: rule.body_mode.to_string(),
@@ -503,33 +489,6 @@ async fn stream_body(
         previewable: complete && original_size <= rule.preview_limit,
         limit_exceeded,
         error,
-    };
-    (meta, capture.into_inner())
-}
-
-/// In-memory copy of the first `limit` bytes of a request body for the stream.
-struct BodyCapture {
-    limit: usize,
-    buf: Option<Vec<u8>>,
-}
-
-impl BodyCapture {
-    fn new(limit: Option<u64>) -> Self {
-        Self {
-            limit: limit.map_or(0, |l| usize::try_from(l).unwrap_or(usize::MAX)),
-            buf: limit.map(|_| Vec::new()),
-        }
-    }
-
-    fn push(&mut self, bytes: &[u8]) {
-        if let Some(buf) = self.buf.as_mut() {
-            let room = self.limit.saturating_sub(buf.len());
-            buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
-        }
-    }
-
-    fn into_inner(self) -> Option<Vec<u8>> {
-        self.buf
     }
 }
 
@@ -718,7 +677,7 @@ mod tests {
         configure(&mut config);
 
         let config = Arc::new(config);
-        let stream = Arc::new(stream::StreamHub::new(&config.stream).expect("stream"));
+        let stream = Arc::new(stream::StreamHub::new(&config).expect("stream"));
         let storage = Arc::new(LocalStorage::new(config.storage.root.clone()));
         storage.ensure_root().await.expect("storage root");
         let state = AppState {
@@ -1013,14 +972,31 @@ mod tests {
         }
     }
 
+    /// HTTP/1.0 so the response body is close-delimited rather than chunked.
+    async fn get_body(server: &TestServer, url: &str, auth: Option<&str>) -> String {
+        let auth = auth
+            .map(|token| format!("authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        raw_http(
+            server.addr,
+            format!("GET {url} HTTP/1.0\r\nhost: localhost\r\n{auth}\r\n").as_bytes(),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn stream_requires_token_and_fans_out_to_independent_consumers() {
-        use base64::Engine;
         use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
         let server = spawn_test_server_with_config(1024, |config| {
             config.stream.token = Some("tok".to_string());
-            config.stream.max_body_size = 8;
+            config.paths = vec![config::PathRule {
+                path_match: "/meta".to_string(),
+                ttl: None,
+                body_mode: Some(config::BodyMode::MetadataOnly),
+                preview_limit: None,
+                max_body_size: None,
+            }];
         })
         .await;
         let url = format!("ws://{}/_wh_admin/stream", server.addr);
@@ -1060,37 +1036,73 @@ mod tests {
             b"POST /api/v1x HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
         )
         .await;
+        raw_http(
+            server.addr,
+            b"POST /meta HTTP/1.1\r\nhost: localhost\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc",
+        )
+        .await;
 
+        let mut hook_url = String::new();
         for ws in [&mut all_a, &mut all_b] {
+            // Envelopes carry metadata and a body_url, never the body itself.
             let first = next_stream_event(ws).await;
             assert_eq!(first["path"], "/other");
             assert_eq!(first["query"], "x=1");
-            let body = base64::engine::general_purpose::STANDARD
-                .decode(first["body_base64"].as_str().expect("body"))
-                .unwrap();
-            assert_eq!(body, b"hello");
-            assert_eq!(first["body_truncated"], false);
-            assert!(first["body_truncated_reason"].is_null());
+            assert_eq!(first["body"]["original_size"], 5);
+            assert!(first.get("body_base64").is_none());
+            let other_url = first["body_url"].as_str().expect("body_url").to_string();
+            assert!(other_url.starts_with("/_wh_admin/stream/body/"));
+            assert_eq!(
+                response_body(&get_body(&server, &other_url, Some("tok")).await),
+                "hello"
+            );
 
-            // Over stream.max_body_size: the first 8 bytes, flagged truncated.
             let second = next_stream_event(ws).await;
             assert_eq!(second["path"], "/api/v1/hook");
-            assert_eq!(second["body"]["original_size"], 10);
-            let body = base64::engine::general_purpose::STANDARD
-                .decode(second["body_base64"].as_str().expect("body"))
-                .unwrap();
-            assert_eq!(body, b"01234567");
-            assert_eq!(second["body_truncated"], true);
-            assert_eq!(
-                second["body_truncated_reason"],
-                "body too big for streaming"
-            );
+            hook_url = second["body_url"].as_str().expect("body_url").to_string();
+
             assert_eq!(next_stream_event(ws).await["path"], "/api/v1x");
+
+            // metadata_only stores no body, so there is nothing to fetch.
+            let meta_only = next_stream_event(ws).await;
+            assert_eq!(meta_only["path"], "/meta");
+            assert!(meta_only["body_url"].is_null());
         }
 
         let filtered = next_stream_event(&mut only_api).await;
         assert_eq!(filtered["path"], "/api/v1/hook");
         assert_eq!(next_stream_event(&mut only_api).await["path"], "/api/v1x");
+
+        // Body endpoint: token rules, gunzip, limit, inert content type.
+        let full = get_body(&server, &hook_url, Some("tok")).await;
+        assert!(
+            full.starts_with("HTTP/1.0 200") || full.starts_with("HTTP/1.1 200"),
+            "{full}"
+        );
+        assert_eq!(response_body(&full), "0123456789");
+        assert_eq!(
+            header_value(&full, "content-type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            header_value(&full, "x-content-type-options"),
+            Some("nosniff")
+        );
+        let head = get_body(&server, &format!("{hook_url}?limit=4"), Some("tok")).await;
+        assert_eq!(response_body(&head), "0123");
+        let by_query = get_body(&server, &format!("{hook_url}?token=tok&limit=2"), None).await;
+        assert_eq!(response_body(&by_query), "01");
+        let denied = get_body(&server, &hook_url, None).await;
+        assert!(denied.contains(" 401 "), "{denied}");
+        let escape = format!(
+            "/_wh_admin/stream/body/{}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                "../../etc/passwd.body.bin"
+            )
+        );
+        let rejected = get_body(&server, &escape, Some("tok")).await;
+        assert!(rejected.contains(" 404 "), "{rejected}");
     }
 
     #[tokio::test]

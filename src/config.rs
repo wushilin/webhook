@@ -35,13 +35,6 @@ pub struct StreamConfig {
     /// its oldest events.
     #[serde(default = "default_stream_buffer")]
     pub buffer: usize,
-    /// At most this many body bytes are included in a stream event; longer
-    /// bodies are cut off and flagged as truncated.
-    #[serde(
-        default = "default_stream_max_body_size",
-        deserialize_with = "deserialize_size"
-    )]
-    pub max_body_size: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -356,7 +349,6 @@ headers = { content-type = "application/json; charset=utf-8" }
 # When unset, anyone can open the stream.
 # token = "..."
 buffer = 1024 # events buffered per consumer before its oldest are dropped
-max_body_size = "5MiB" # longer bodies are cut to this size and flagged truncated
 "#
 }
 
@@ -374,7 +366,6 @@ impl Default for StreamConfig {
         Self {
             token: None,
             buffer: default_stream_buffer(),
-            max_body_size: default_stream_max_body_size(),
         }
     }
 }
@@ -479,10 +470,6 @@ fn default_max_body_size() -> u64 {
 
 fn default_stream_buffer() -> usize {
     1024
-}
-
-fn default_stream_max_body_size() -> u64 {
-    5 * 1024 * 1024
 }
 
 fn default_response_status() -> u16 {
@@ -628,6 +615,5 @@ admin_prefix = "/_custom_admin///"
         assert!(parsed.paths.is_empty());
         assert_eq!(parsed.stream.token, default.stream.token);
         assert_eq!(parsed.stream.buffer, default.stream.buffer);
-        assert_eq!(parsed.stream.max_body_size, default.stream.max_body_size);
     }
 }

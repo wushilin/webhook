@@ -101,6 +101,10 @@ pub async fn handle_admin(state: AppState, req: Request<Body>) -> Response {
         "/logout" => logout(&state, req.headers()),
         // Authenticated by stream.token rather than the admin session.
         "/stream" => crate::stream::handle(state, req).await,
+        p if p.starts_with("/stream/body/") => {
+            let body_ref = p.trim_start_matches("/stream/body/").to_string();
+            crate::stream::body(state, req, &body_ref).await
+        }
         // A static shell: every event it shows comes through the token-gated stream.
         "/streamview" => stream_view(&state),
         _ if !is_authorized(&state, req.headers()) => redirect(&format!("{prefix}/login")),
@@ -839,6 +843,12 @@ button.secondary:hover { background: #e7e6e1; }
 .sv-tools { display: flex; gap: 6px; margin-left: auto; text-transform: none; letter-spacing: 0; }
 .sv-tools button, .sv-more { padding: 4px 10px; font-size: 12px; }
 .sv-more { margin-top: 8px; }
+.sv-partial {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 8px;
+  font-size: 13px; color: var(--ink-2);
+}
+.sv-partial .sv-more { margin: 0; }
+.sv-partial[hidden] { display: none; }
 .sv-kind {
   padding: 1px 7px; border-radius: 6px; background: #e7f0fb; color: var(--accent-deep);
   letter-spacing: 0.02em;

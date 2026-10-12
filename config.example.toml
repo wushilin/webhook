@@ -35,7 +35,6 @@ headers = { content-type = "application/json; charset=utf-8" }
 # When unset, anyone can open the stream.
 token = "changeme-stream"
 buffer = 1024
-max_body_size = "5MiB"
 
 [[responders]]
 match = "/api1"

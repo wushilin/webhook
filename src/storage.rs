@@ -430,6 +430,10 @@ impl StatsAccumulator {
 }
 
 impl StoredRequestPaths {
+    pub fn body_path(&self) -> Option<&Path> {
+        self.body_path.as_deref()
+    }
+
     pub fn body_file_name(&self) -> Option<String> {
         self.body_file_name.clone()
     }
