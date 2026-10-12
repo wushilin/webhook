@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     models::RequestMeta,
-    storage::{SearchPage, SearchQuery},
+    storage::{Counts, Granularity, SearchPage, SearchQuery, METHODS},
     AppState,
 };
 
@@ -126,7 +126,7 @@ pub async fn handle_admin(state: AppState, req: Request<Body>) -> Response {
         // A static shell: every event it shows comes through the token-gated stream.
         "/streamview" => stream_view(&state),
         _ if !is_authorized(&state, req.headers()) => redirect(&format!("{prefix}/login")),
-        "" | "/" => overview(state).await,
+        "" | "/" => overview(state, req.uri().query()).await,
         "/requests" => requests(state, req.uri().query()).await,
         p if p.starts_with("/requests/") && p.ends_with("/body") => {
             let id = decode_component(p.trim_start_matches("/requests/").trim_end_matches("/body"));
@@ -265,89 +265,314 @@ fn decode_component(raw: &str) -> String {
 
 // ---------- overview ----------
 
-async fn overview(state: AppState) -> Response {
-    let stats = match state.storage.dashboard().await {
-        Ok(stats) => stats,
+/// Dashboard range: total span, bucket granularity read from the database,
+/// and the display bin width (a whole number of buckets).
+struct OverviewRange {
+    key: &'static str,
+    label: &'static str,
+    bins: u64,
+    bin_secs: u64,
+    granularity: Granularity,
+    bin_label: &'static str,
+}
+
+const OVERVIEW_RANGES: [OverviewRange; 4] = [
+    OverviewRange {
+        key: "1h",
+        label: "1 hour",
+        bins: 60,
+        bin_secs: 60,
+        granularity: Granularity::Minute,
+        bin_label: "minute",
+    },
+    OverviewRange {
+        key: "24h",
+        label: "24 hours",
+        bins: 48,
+        bin_secs: 30 * 60,
+        granularity: Granularity::Minute,
+        bin_label: "30 minutes",
+    },
+    OverviewRange {
+        key: "7d",
+        label: "7 days",
+        bins: 56,
+        bin_secs: 3 * 3600,
+        granularity: Granularity::Hour,
+        bin_label: "3 hours",
+    },
+    OverviewRange {
+        key: "30d",
+        label: "30 days",
+        bins: 30,
+        bin_secs: 86_400,
+        granularity: Granularity::Hour,
+        bin_label: "day",
+    },
+];
+
+async fn overview(state: AppState, query: Option<&str>) -> Response {
+    let prefix = admin_prefix(&state);
+    let form = query.map(parse_form).unwrap_or_default();
+    let selected = form_value(&form, "range").unwrap_or_default();
+    let range = OVERVIEW_RANGES
+        .iter()
+        .find(|r| r.key == selected)
+        .unwrap_or(&OVERVIEW_RANGES[1]);
+
+    // Bins end at the next bin boundary in local time, so the last bin is
+    // the current, partial one.
+    let offset = i64::from(Local::now().offset().local_minus_utc());
+    let now = crate::storage::epoch_secs(SystemTime::now()) as i64;
+    let width = range.bin_secs as i64;
+    let end = ((now + offset) / width + 1) * width - offset;
+    let start = end - width * range.bins as i64;
+    let to_time = |secs: i64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64);
+
+    let (buckets, totals) = match tokio::try_join!(
+        state
+            .storage
+            .counts(to_time(start), to_time(end), range.granularity),
+        state.storage.totals()
+    ) {
+        Ok(result) => result,
         Err(err) => return error_response(err),
     };
-    let prefix = admin_prefix(&state);
-    let top = stats
-        .top_paths
-        .first()
-        .map_or(1, |(_, count)| *count)
-        .max(1);
-    let path_rows = if stats.top_paths.is_empty() {
-        r#"<tr><td colspan="2" class="empty">No requests captured since the server started.</td></tr>"#
-            .to_string()
-    } else {
-        stats
-            .top_paths
-            .iter()
-            .map(|(path, count)| {
-                format!(
-                    r#"<tr><td class="bar-cell mono"><span class="bar" style="width:{width}%"></span><a href="{prefix}/requests?path={path_q}">{path}</a></td><td class="num">{count}</td></tr>"#,
-                    width = count * 100 / top,
-                    path_q = urlencoding::encode(path),
-                    path = escape(path),
-                )
-            })
-            .collect()
-    };
-    let method_rows = if stats.top_methods.is_empty() {
-        r#"<tr><td colspan="2" class="empty">Nothing yet.</td></tr>"#.to_string()
-    } else {
-        stats
-            .top_methods
-            .iter()
-            .map(|(method, count)| {
-                format!(
-                    r#"<tr><td>{}</td><td class="num">{count}</td></tr>"#,
-                    method_chip(method)
-                )
-            })
-            .collect()
-    };
+    let mut bins = vec![Counts::default(); range.bins as usize];
+    let mut total = Counts::default();
+    for (bucket, counts) in &buckets {
+        let index = (*bucket as i64 - start).div_euclid(width);
+        if let Some(bin) = usize::try_from(index).ok().and_then(|i| bins.get_mut(i)) {
+            *bin += *counts;
+            total += *counts;
+        }
+    }
 
-    let body = format!(
-        r#"<div class="section-label">Since the server started</div>
-<section class="metrics">
-  <div class="tile"><span>Requests</span><b>{total}</b></div>
-  <div class="tile"><span>Complete</span><b>{complete}</b></div>
-  <div class="tile"><span>Incomplete</span><b>{incomplete}</b></div>
-  <div class="tile"><span>Body data received</span><b>{bytes}</b></div>
-</section>
-<div class="section-label">Stored</div>
-<section class="metrics">
-  <div class="tile"><span>Requests kept</span><b>{stored}</b><small>approximate</small></div>
-  <div class="tile"><span>Database on disk</span><b>{db}</b><small>metadata, indexes and journal</small></div>
-  <div class="tile"><span>Retention</span><b>{ttl}</b><small>default; per-path rules may differ</small></div>
-</section>
-<section class="grid">
-  <div class="card flush">
-    <div class="card-head" style="padding:14px 16px 0"><h2>Most active paths</h2><a href="{prefix}/requests">Search requests &rarr;</a></div>
-    <table><thead><tr><th>Path</th><th class="num">Requests</th></tr></thead><tbody>{path_rows}</tbody></table>
+    let range_links: String = OVERVIEW_RANGES
+        .iter()
+        .map(|r| {
+            format!(
+                r#"<a href="{prefix}/?range={}" class="{}">{}</a>"#,
+                r.key,
+                if r.key == range.key { "active" } else { "" },
+                r.label
+            )
+        })
+        .collect();
+    let head = format!(
+        r#"<div class="page-head">
+  <div><h1>Overview</h1><p>Captured requests over the last {label}.</p></div>
+  <div class="actions"><span class="ranges">{range_links}</span></div>
+</div>"#,
+        label = range.label
+    );
+
+    let tile = |label: &str, value: String, note: &str| {
+        format!(
+            r#"<div class="tile"><span>{label}</span><b>{value}</b>{}</div>"#,
+            if note.is_empty() {
+                String::new()
+            } else {
+                format!("<small>{note}</small>")
+            }
+        )
+    };
+    let tiles = [
+        tile("Requests", compact(total.requests), ""),
+        tile("Complete", compact(total.complete), ""),
+        tile(
+            "Incomplete",
+            compact(total.incomplete),
+            "client disconnected mid-body",
+        ),
+        tile(
+            "Limit exceeded",
+            compact(total.limit_exceeded),
+            "rejected with 413",
+        ),
+        tile("Body data received", human_bytes(total.body_bytes), ""),
+    ]
+    .join("");
+
+    let chart = column_chart(range, start, width, &bins);
+    let methods = method_bars(&total);
+    let stored = format!(
+        r#"<div class="card">
+  <div class="card-head"><h2>Stored now</h2><a href="{prefix}/requests">Search requests &rarr;</a></div>
+  <div class="stored">
+    <div><span>Requests kept</span><b>{kept}</b><small>approximate</small></div>
+    <div><span>Database on disk</span><b>{db}</b><small>metadata, indexes and journal</small></div>
+    <div><span>Retention</span><b>{ttl}</b><small>default; per-path rules may differ</small></div>
   </div>
-  <div class="card flush">
-    <div class="card-head" style="padding:14px 16px 0"><h2>Methods</h2></div>
-    <table><thead><tr><th>Method</th><th class="num">Requests</th></tr></thead><tbody>{method_rows}</tbody></table>
-  </div>
-</section>"#,
-        total = stats.total_requests,
-        complete = stats.complete_requests,
-        incomplete = stats.incomplete_requests,
-        bytes = human_bytes(stats.stored_body_bytes),
-        stored = stats.stored_requests,
-        db = human_bytes(stats.db_disk_bytes),
+</div>"#,
+        kept = compact(totals.stored_requests as u64),
+        db = human_bytes(totals.db_disk_bytes),
         ttl = short_duration(state.config.retention.default_ttl),
     );
-    page(
-        &state,
-        "Overview",
-        Some("Traffic since the last restart, and what is kept on disk."),
-        "overview",
-        "",
-        &body,
+
+    let body = format!(
+        r#"<section class="metrics">{tiles}</section>
+{chart}
+<section class="grid">{methods}{stored}</section>"#
+    );
+    page(&state, "Overview", None, "overview", &head, &body)
+}
+
+/// Requests per bin as columns: hover or focus a column for its numbers; the
+/// same numbers are in the table under "Show as table".
+fn column_chart(range: &OverviewRange, start: i64, width: i64, bins: &[Counts]) -> String {
+    let max = bins.iter().map(|b| b.requests).max().unwrap_or(0);
+    let top = nice_ceiling(max);
+    let bin_start = |i: usize| {
+        chrono::DateTime::<Local>::from(
+            SystemTime::UNIX_EPOCH + Duration::from_secs((start + width * i as i64).max(0) as u64),
+        )
+    };
+    let time_label = |i: usize| {
+        let t = bin_start(i);
+        if width >= 86_400 {
+            t.format("%b %-d").to_string()
+        } else if width >= 3_600 {
+            t.format("%b %-d %H:%M").to_string()
+        } else {
+            t.format("%H:%M").to_string()
+        }
+    };
+    let span_label = |i: usize| format!("{} – {}", time_label(i), time_label(i + 1));
+
+    let columns: String = bins
+        .iter()
+        .enumerate()
+        .map(|(i, bin)| {
+            let pct = if top == 0 { 0.0 } else { bin.requests as f64 * 100.0 / top as f64 };
+            let detail = if bin.incomplete + bin.limit_exceeded > 0 {
+                format!(
+                    "{} incomplete · {} over limit",
+                    bin.incomplete, bin.limit_exceeded
+                )
+            } else {
+                String::new()
+            };
+            let value = format!(
+                "{} request{}",
+                bin.requests,
+                if bin.requests == 1 { "" } else { "s" }
+            );
+            format!(
+                r#"<div class="col" tabindex="0" data-value="{value}" data-title="{title}" data-detail="{detail}"><span class="col-bar{empty}" style="height:{pct:.2}%"></span></div>"#,
+                title = escape(&span_label(i)),
+                detail = escape(&detail),
+                empty = if bin.requests == 0 { " zero" } else { "" },
+            )
+        })
+        .collect();
+    let ticks: String = [(top, 100), (top / 2, 50), (0, 0)]
+        .iter()
+        .map(|(value, at)| {
+            format!(
+                r#"<span class="tick" style="bottom:{at}%"><i>{}</i></span>"#,
+                compact(*value)
+            )
+        })
+        .collect();
+    let last = bins.len().saturating_sub(1);
+    let x_labels = format!(
+        r#"<span>{}</span><span>{}</span><span>{}</span>"#,
+        escape(&time_label(0)),
+        escape(&time_label(bins.len() / 2)),
+        escape(&time_label(last)),
+    );
+    let table_rows: String = bins
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, bin)| {
+            format!(
+                r#"<tr><td>{}</td><td class="num">{}</td><td class="num">{}</td><td class="num">{}</td><td class="num">{}</td></tr>"#,
+                escape(&span_label(i)),
+                bin.requests,
+                bin.complete,
+                bin.incomplete,
+                bin.limit_exceeded
+            )
+        })
+        .collect();
+
+    format!(
+        r#"<div class="card chart-card">
+  <div class="card-head"><h2>Requests per {bin_label}</h2><span class="muted">peak {peak}</span></div>
+  <div class="chart" role="img" aria-label="Requests per {bin_label} over the last {label}; peak {peak}.">
+    <div class="chart-plot">{ticks}<div class="cols">{columns}</div></div>
+    <div class="chart-x">{x_labels}</div>
+  </div>
+  <details class="chart-table"><summary>Show as table</summary>
+    <table><thead><tr><th>Time</th><th class="num">Requests</th><th class="num">Complete</th><th class="num">Incomplete</th><th class="num">Over limit</th></tr></thead><tbody>{table_rows}</tbody></table>
+  </details>
+</div>"#,
+        bin_label = range.bin_label,
+        label = range.label,
+        peak = compact(max),
     )
+}
+
+fn method_bars(total: &Counts) -> String {
+    let max = total.methods.iter().copied().max().unwrap_or(0).max(1);
+    let rows: String = METHODS
+        .iter()
+        .zip(total.methods)
+        .filter(|(_, count)| *count > 0)
+        .map(|(method, count)| {
+            format!(
+                r#"<div class="hbar"><span class="hbar-label">{chip}</span><span class="hbar-track"><span class="hbar-fill" style="width:{pct:.2}%"></span></span><span class="hbar-value">{value}</span></div>"#,
+                chip = method_chip(method),
+                pct = count as f64 * 100.0 / max as f64,
+                value = compact(count),
+            )
+        })
+        .collect();
+    format!(
+        r#"<div class="card"><div class="card-head"><h2>Methods</h2></div>{}</div>"#,
+        if rows.is_empty() {
+            r#"<p class="muted">No requests in this range.</p>"#.to_string()
+        } else {
+            rows
+        }
+    )
+}
+
+/// Smallest 1, 2 or 5 × 10^k at or above `value`, for a clean axis top.
+fn nice_ceiling(value: u64) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    let mut magnitude = 1u64;
+    while magnitude.saturating_mul(10) <= value {
+        magnitude *= 10;
+    }
+    [1, 2, 5, 10]
+        .iter()
+        .map(|step| step * magnitude)
+        .find(|candidate| *candidate >= value)
+        .unwrap_or(value)
+}
+
+/// 1,284 → "1,284"; 12,900 → "12.9K"; 4,200,000 → "4.2M".
+fn compact(value: u64) -> String {
+    match value {
+        0..=9_999 => {
+            let digits = value.to_string();
+            let mut out = String::new();
+            for (i, ch) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                    out.push(',');
+                }
+                out.push(ch);
+            }
+            out
+        }
+        10_000..=999_999 => format!("{:.1}K", value as f64 / 1_000.0),
+        _ => format!("{:.1}M", value as f64 / 1_000_000.0),
+    }
 }
 
 // ---------- requests explorer ----------

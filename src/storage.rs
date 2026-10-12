@@ -1,52 +1,75 @@
 //! Request storage: envelopes (request metadata) in a fjall database, bodies
 //! as blob files in a fixed hashed fan-out.
 //!
+//! Every database read is a point lookup or a bounded range over ordered
+//! keys; nothing scans a whole keyspace. fjall is synchronous, so every call
+//! runs on the blocking thread pool.
+//!
 //! Keyspaces:
 //! - `envelopes`: `id` → `RequestMeta` JSON.
 //! - `by_time`: `received_at nanos (u64 BE) ++ path ++ 0x00 ++ id` → empty.
 //!   Time-ordered with the path in the key, so path-prefix searches over a
-//!   time window are key-only scans.
+//!   time window read keys only.
 //! - `expiry`: `expires_at secs (u64 BE) ++ id` → empty. Retention reads it
-//!   from the start up to now, so cleanup costs O(expired requests) and never
-//!   walks a directory tree.
+//!   from the start up to now: cost is O(expired requests).
+//! - `stats_min` / `stats_hour`: `bucket start secs (u64 BE)` → [`Counts`].
+//!   Dashboard totals read at most a day of minutes or a month of hours.
 //!
-//! Blobs live at `<blobs>/<h1>/<h2>/<id>.body.bin[.gz]`, where `h1/h2` come
-//! from a hash of the id. The id in the file name is the envelope key, so an
-//! orphan blob (no envelope) is recognisable from its name alone.
+//! Blobs live at `<blobs>/<hhhh>/<id>.body.bin[.gz]`: one level of 65,536
+//! folders named by 4 hex characters of a hash of the id. The id in the file
+//! name is the envelope key, so an orphan blob is recognisable from its name.
 
 use std::{
     collections::BTreeMap,
+    ops::AddAssign,
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
-use tokio::{fs, sync::RwLock};
+use tokio::fs;
 use tracing::{info, warn};
 
 use crate::{config, models::RequestMeta};
 
-const PATH_STATS_IDLE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const PATH_STATS_LIMIT: usize = 5_000;
-const PATH_STATS_PRUNE_TARGET: usize = PATH_STATS_LIMIT * 9 / 10;
 /// Longer paths are cut in the `by_time` key (fjall keys are at most 64KiB);
 /// the full path is still in the envelope.
 const MAX_KEY_PATH_BYTES: usize = 4096;
 const CLEANUP_BATCH: usize = 1_000;
-/// The orphan sweep covers this many of the 256 top-level fan-out folders per
-/// cleanup pass, so a full sweep takes 256 / 16 = 16 passes.
-const SWEEP_DIRS_PER_PASS: usize = 16;
+const FAN_OUT_DIRS: usize = 0x1_0000;
+/// The sweep visits this many fan-out folders per cleanup pass, so a full
+/// round takes 65,536 / 4,096 = 16 passes.
+const SWEEP_DIRS_PER_PASS: usize = 4_096;
+/// An empty fan-out folder is removed only once untouched this long. Deleting
+/// a blob updates its folder's mtime, and writers touch the folder before
+/// creating a blob, so a folder in use is never older than this.
+const EMPTY_DIR_GRACE: Duration = Duration::from_secs(30 * 60);
+/// Attempts at "create folder, touch it, create file" before giving up.
+const CREATE_ATTEMPTS: u32 = 5;
 const BODY_SUFFIXES: [&str; 2] = [".body.bin.gz", ".body.bin"];
+const MINUTE: u64 = 60;
+const HOUR: u64 = 60 * 60;
+/// Minute buckets serve ranges up to a day; hour buckets everything longer.
+const STATS_MINUTE_KEEP: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+const STATS_HOUR_KEEP: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 pub struct Storage {
     db: Database,
     envelopes: Keyspace,
     by_time: Keyspace,
     expiry: Keyspace,
+    stats_min: Keyspace,
+    stats_hour: Keyspace,
     blobs: PathBuf,
-    stats: RwLock<StatsAccumulator>,
+    /// Counts not yet written to the stats keyspaces, by minute.
+    pending: Mutex<BTreeMap<u64, Counts>>,
+    /// Serializes stats flushes, which read-modify-write buckets.
+    flush_lock: tokio::sync::Mutex<()>,
     sweep_cursor: AtomicUsize,
 }
 
@@ -85,35 +108,116 @@ pub struct SearchPage {
     pub scanned_back_to: Option<SystemTime>,
 }
 
+/// Method slots in [`Counts::methods`].
+pub const METHODS: [&str; 6] = ["GET", "POST", "PUT", "PATCH", "DELETE", "Other"];
+
+/// Request counts for one time bucket.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    pub requests: u64,
+    pub complete: u64,
+    pub incomplete: u64,
+    pub limit_exceeded: u64,
+    pub body_bytes: u64,
+    pub methods: [u64; 6],
+}
+
+impl Counts {
+    fn of(meta: &RequestMeta) -> Self {
+        let mut counts = Self {
+            requests: 1,
+            body_bytes: meta.body.original_size,
+            ..Self::default()
+        };
+        if meta.body.limit_exceeded {
+            counts.limit_exceeded = 1;
+        } else if meta.body.complete {
+            counts.complete = 1;
+        } else {
+            counts.incomplete = 1;
+        }
+        let slot = METHODS
+            .iter()
+            .position(|m| *m == meta.method)
+            .unwrap_or(METHODS.len() - 1);
+        counts.methods[slot] = 1;
+        counts
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        [
+            self.requests,
+            self.complete,
+            self.incomplete,
+            self.limit_exceeded,
+            self.body_bytes,
+        ]
+        .iter()
+        .chain(self.methods.iter())
+        .flat_map(|v| v.to_le_bytes())
+        .collect()
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        let mut values = bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c));
+        let mut next = || values.next().unwrap_or(0);
+        let mut counts = Self {
+            requests: next(),
+            complete: next(),
+            incomplete: next(),
+            limit_exceeded: next(),
+            body_bytes: next(),
+            methods: [0; 6],
+        };
+        for slot in &mut counts.methods {
+            *slot = next();
+        }
+        counts
+    }
+}
+
+impl AddAssign for Counts {
+    fn add_assign(&mut self, other: Self) {
+        self.requests += other.requests;
+        self.complete += other.complete;
+        self.incomplete += other.incomplete;
+        self.limit_exceeded += other.limit_exceeded;
+        self.body_bytes += other.body_bytes;
+        for (slot, value) in self.methods.iter_mut().zip(other.methods) {
+            *slot += value;
+        }
+    }
+}
+
+/// Bucket width for [`Storage::counts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Granularity {
+    Minute,
+    Hour,
+}
+
+impl Granularity {
+    pub fn seconds(self) -> u64 {
+        match self {
+            Self::Minute => MINUTE,
+            Self::Hour => HOUR,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
-pub struct DashboardStats {
-    pub total_requests: usize,
-    pub complete_requests: usize,
-    pub incomplete_requests: usize,
-    pub stored_body_bytes: u64,
-    pub top_paths: Vec<(String, usize)>,
-    pub top_methods: Vec<(String, usize)>,
+pub struct StoreTotals {
     pub stored_requests: usize,
     pub db_disk_bytes: u64,
 }
 
-#[derive(Debug, Default)]
-struct StatsAccumulator {
-    total_requests: usize,
-    complete_requests: usize,
-    incomplete_requests: usize,
-    stored_body_bytes: u64,
-    paths: BTreeMap<String, PathStats>,
-    methods: BTreeMap<String, usize>,
-}
-
-#[derive(Debug, Clone)]
-struct PathStats {
-    count: usize,
-    last_seen: SystemTime,
-}
-
 impl Storage {
+    /// Opens (creating if needed) the database and blob root. Blocking; call
+    /// through [`Storage::open_async`] from async code.
     pub fn open(db_path: &Path, blobs: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(db_path)
             .with_context(|| format!("failed to create {}", db_path.display()))?;
@@ -122,18 +226,23 @@ impl Storage {
         let db = Database::builder(db_path)
             .open()
             .with_context(|| format!("failed to open database at {}", db_path.display()))?;
-        let envelopes = db.keyspace("envelopes", KeyspaceCreateOptions::default)?;
-        let by_time = db.keyspace("by_time", KeyspaceCreateOptions::default)?;
-        let expiry = db.keyspace("expiry", KeyspaceCreateOptions::default)?;
+        let keyspace = |name| db.keyspace(name, KeyspaceCreateOptions::default);
         Ok(Self {
+            envelopes: keyspace("envelopes")?,
+            by_time: keyspace("by_time")?,
+            expiry: keyspace("expiry")?,
+            stats_min: keyspace("stats_min")?,
+            stats_hour: keyspace("stats_hour")?,
             db,
-            envelopes,
-            by_time,
-            expiry,
             blobs: blobs.to_path_buf(),
-            stats: RwLock::new(StatsAccumulator::default()),
+            pending: Mutex::new(BTreeMap::new()),
+            flush_lock: tokio::sync::Mutex::new(()),
             sweep_cursor: AtomicUsize::new(0),
         })
+    }
+
+    pub async fn open_async(db_path: PathBuf, blobs: PathBuf) -> anyhow::Result<Self> {
+        tokio::task::spawn_blocking(move || Self::open(&db_path, &blobs)).await?
     }
 
     pub fn blob_location(&self, id: &str, mode: config::BodyMode) -> Option<BlobLocation> {
@@ -155,16 +264,39 @@ impl Storage {
             .then(|| self.blobs.join(relative))
     }
 
+    /// Creates a blob file: create the folder, touch it, create the file,
+    /// and on any failure repeat all three. The sweep may remove an empty
+    /// folder between two steps; the touch keeps it fresh for the retry.
     pub async fn create_body_file(&self, location: &BlobLocation) -> anyhow::Result<fs::File> {
-        if let Some(parent) = location.path.parent() {
-            fs::create_dir_all(parent).await?;
+        let dir = location
+            .path
+            .parent()
+            .context("blob path has no parent folder")?;
+        let mut last_error = None;
+        for attempt in 0..CREATE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(10 * u64::from(attempt))).await;
+            }
+            if let Err(err) = fs::create_dir_all(dir).await {
+                last_error = Some(err);
+                continue;
+            }
+            touch_dir(dir).await;
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&location.path)
+                .await
+            {
+                Ok(file) => return Ok(file),
+                Err(err) => last_error = Some(err),
+            }
         }
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&location.path)
-            .await
-            .with_context(|| format!("failed to create {}", location.path.display()))
+        Err(anyhow::anyhow!(
+            "failed to create {} after {CREATE_ATTEMPTS} attempts: {}",
+            location.path.display(),
+            last_error.map_or_else(|| "unknown error".to_string(), |e| e.to_string())
+        ))
     }
 
     /// Records the envelope and its index entries in one atomic batch. Called
@@ -175,7 +307,12 @@ impl Storage {
         let time_key = time_key(meta);
         let expiry_key = expiry_key(expires_at, &meta.id);
         let id = meta.id.clone();
-        let (db, envelopes, by_time, expiry) = self.handles();
+        let (db, envelopes, by_time, expiry) = (
+            self.db.clone(),
+            self.envelopes.clone(),
+            self.by_time.clone(),
+            self.expiry.clone(),
+        );
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut batch = db.batch();
             batch.insert(&envelopes, id.as_bytes(), json);
@@ -185,7 +322,7 @@ impl Storage {
             Ok(())
         })
         .await??;
-        self.record_stats(meta).await;
+        self.count(meta);
         Ok(())
     }
 
@@ -209,30 +346,114 @@ impl Storage {
         tokio::task::spawn_blocking(move || search_blocking(&by_time, &envelopes, &query)).await?
     }
 
-    pub async fn dashboard(&self) -> anyhow::Result<DashboardStats> {
-        let mut stats = self.stats.write().await;
-        stats.prune_paths(SystemTime::now());
-        Ok(DashboardStats {
-            total_requests: stats.total_requests,
-            complete_requests: stats.complete_requests,
-            incomplete_requests: stats.incomplete_requests,
-            stored_body_bytes: stats.stored_body_bytes,
-            top_paths: sorted_counts(
-                stats
-                    .paths
-                    .iter()
-                    .map(|(path, path_stats)| (path.clone(), path_stats.count))
-                    .collect(),
-                20,
-            ),
-            top_methods: sorted_counts(stats.methods.clone(), 8),
-            stored_requests: self.envelopes.approximate_len(),
-            db_disk_bytes: self.db.disk_space().unwrap_or(0),
-        })
+    // ---------- counters ----------
+
+    fn count(&self, meta: &RequestMeta) {
+        let received: SystemTime = meta.received_at.into();
+        let minute = floor_to(epoch_secs(received), MINUTE);
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        *pending.entry(minute).or_default() += Counts::of(meta);
     }
 
-    /// Deletes every request whose expiry has passed, then sweeps a slice of
-    /// the blob fan-out for orphans untouched for `prune_grace`.
+    /// Adds pending counts into the minute and hour buckets. Runs from a timer
+    /// and at shutdown; the lock keeps read-modify-write single-writer.
+    pub async fn flush_stats(&self) -> anyhow::Result<()> {
+        let _flush = self.flush_lock.lock().await;
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut hours: BTreeMap<u64, Counts> = BTreeMap::new();
+        for (minute, counts) in &pending {
+            *hours.entry(floor_to(*minute, HOUR)).or_default() += *counts;
+        }
+        let (db, stats_min, stats_hour) = (
+            self.db.clone(),
+            self.stats_min.clone(),
+            self.stats_hour.clone(),
+        );
+        let result = tokio::task::spawn_blocking({
+            let pending = pending.clone();
+            move || -> anyhow::Result<()> {
+                let mut batch = db.batch();
+                for (keyspace, buckets) in [(&stats_min, &pending), (&stats_hour, &hours)] {
+                    for (start, counts) in buckets {
+                        let key = start.to_be_bytes();
+                        let mut total = keyspace
+                            .get(key)?
+                            .map(|v| Counts::decode(&v))
+                            .unwrap_or_default();
+                        total += *counts;
+                        batch.insert(keyspace, key, total.encode());
+                    }
+                }
+                batch.commit()?;
+                Ok(())
+            }
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r);
+        if result.is_err() {
+            // Put the counts back so the next flush retries them.
+            let mut current = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            for (minute, counts) in pending {
+                *current.entry(minute).or_default() += counts;
+            }
+        }
+        result
+    }
+
+    /// Per-bucket counts for `[from, to)`, including counts not yet flushed.
+    /// Reads at most `(to - from) / granularity` keys.
+    pub async fn counts(
+        &self,
+        from: SystemTime,
+        to: SystemTime,
+        granularity: Granularity,
+    ) -> anyhow::Result<BTreeMap<u64, Counts>> {
+        let width = granularity.seconds();
+        let lower = floor_to(epoch_secs(from), width);
+        let upper = epoch_secs(to);
+        let keyspace = match granularity {
+            Granularity::Minute => self.stats_min.clone(),
+            Granularity::Hour => self.stats_hour.clone(),
+        };
+        let mut buckets =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<BTreeMap<u64, Counts>> {
+                let mut out = BTreeMap::new();
+                let range = lower.to_be_bytes()..upper.to_be_bytes();
+                for guard in keyspace.range(range) {
+                    let (key, value) = guard.into_inner()?;
+                    if let Ok(bytes) = <[u8; 8]>::try_from(key.as_ref()) {
+                        out.insert(u64::from_be_bytes(bytes), Counts::decode(&value));
+                    }
+                }
+                Ok(out)
+            })
+            .await??;
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for (minute, counts) in pending.range(lower..upper) {
+            *buckets.entry(floor_to(*minute, width)).or_default() += *counts;
+        }
+        Ok(buckets)
+    }
+
+    /// Approximate stored request count and database size, from metadata.
+    pub async fn totals(&self) -> anyhow::Result<StoreTotals> {
+        let (db, envelopes) = (self.db.clone(), self.envelopes.clone());
+        tokio::task::spawn_blocking(move || StoreTotals {
+            stored_requests: envelopes.approximate_len(),
+            db_disk_bytes: db.disk_space().unwrap_or(0),
+        })
+        .await
+        .map_err(Into::into)
+    }
+
+    // ---------- retention ----------
+
+    /// Deletes every request whose expiry has passed and stats buckets past
+    /// their keep window, then sweeps a slice of the blob fan-out.
     pub async fn cleanup(&self, config: &config::Config) -> anyhow::Result<()> {
         let now = SystemTime::now();
         let mut removed = 0usize;
@@ -256,7 +477,8 @@ impl Storage {
         if removed > 0 {
             info!(removed, "retention removed expired requests");
         }
-        self.sweep_orphans(config.retention.prune_grace).await;
+        self.prune_stats(now).await?;
+        self.sweep_blobs(config.retention.prune_grace).await;
         Ok(())
     }
 
@@ -291,7 +513,12 @@ impl Storage {
         }
         let time_key = meta.as_ref().map(time_key);
         let id = id.to_string();
-        let (db, envelopes, by_time, expiry) = self.handles();
+        let (db, envelopes, by_time, expiry) = (
+            self.db.clone(),
+            self.envelopes.clone(),
+            self.by_time.clone(),
+            self.expiry.clone(),
+        );
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut batch = db.batch();
             batch.remove(&envelopes, id.as_bytes());
@@ -306,37 +533,81 @@ impl Storage {
         Ok(true)
     }
 
-    async fn sweep_orphans(&self, grace: Duration) {
+    async fn prune_stats(&self, now: SystemTime) -> anyhow::Result<()> {
+        let (db, stats_min, stats_hour) = (
+            self.db.clone(),
+            self.stats_min.clone(),
+            self.stats_hour.clone(),
+        );
+        let cutoffs = [
+            epoch_secs(now.checked_sub(STATS_MINUTE_KEEP).unwrap_or(UNIX_EPOCH)),
+            epoch_secs(now.checked_sub(STATS_HOUR_KEEP).unwrap_or(UNIX_EPOCH)),
+        ];
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut batch = db.batch();
+            for (keyspace, cutoff) in [(&stats_min, cutoffs[0]), (&stats_hour, cutoffs[1])] {
+                let upper = cutoff.to_be_bytes();
+                for guard in keyspace.range(..upper.as_slice()).take(CLEANUP_BATCH) {
+                    batch.remove(keyspace, guard.key()?);
+                }
+            }
+            batch.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Visits the next slice of fan-out folders: removes orphan blobs (no
+    /// envelope, untouched for `orphan_grace`) and folders left empty and
+    /// untouched for [`EMPTY_DIR_GRACE`].
+    async fn sweep_blobs(&self, orphan_grace: Duration) {
         let start = self
             .sweep_cursor
-            .fetch_add(SWEEP_DIRS_PER_PASS, Ordering::Relaxed);
-        for offset in 0..SWEEP_DIRS_PER_PASS {
-            let top = self.blobs.join(format!("{:02x}", (start + offset) % 256));
-            let Ok(mut subdirs) = fs::read_dir(&top).await else {
+            .fetch_add(SWEEP_DIRS_PER_PASS, Ordering::Relaxed)
+            % FAN_OUT_DIRS;
+        let in_slice = |name: &str| {
+            let Ok(index) = usize::from_str_radix(name, 16) else {
+                return false;
+            };
+            name.len() == 4 && (index + FAN_OUT_DIRS - start) % FAN_OUT_DIRS < SWEEP_DIRS_PER_PASS
+        };
+        let Ok(mut dirs) = fs::read_dir(&self.blobs).await else {
+            return;
+        };
+        while let Ok(Some(dir)) = dirs.next_entry().await {
+            let name = dir.file_name();
+            if !name.to_str().is_some_and(in_slice) {
+                continue;
+            }
+            let path = dir.path();
+            let Ok(mut files) = fs::read_dir(&path).await else {
                 continue;
             };
-            while let Ok(Some(subdir)) = subdirs.next_entry().await {
-                let Ok(mut files) = fs::read_dir(subdir.path()).await else {
-                    continue;
-                };
-                while let Ok(Some(file)) = files.next_entry().await {
-                    self.remove_if_orphan(&file.path(), grace).await;
+            let mut remaining = 0usize;
+            while let Ok(Some(file)) = files.next_entry().await {
+                if !self.remove_if_orphan(&file.path(), orphan_grace).await {
+                    remaining += 1;
                 }
+            }
+            // remove_dir refuses a folder a writer has just filled.
+            if remaining == 0 && is_older_than(&path, EMPTY_DIR_GRACE).await {
+                let _ = fs::remove_dir(&path).await;
             }
         }
     }
 
-    async fn remove_if_orphan(&self, file: &Path, grace: Duration) {
+    /// Returns true when `file` was an orphan and has been removed.
+    async fn remove_if_orphan(&self, file: &Path, grace: Duration) -> bool {
         let Some(id) = file
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|name| BODY_SUFFIXES.iter().find_map(|s| name.strip_suffix(s)))
         else {
-            return;
+            return false;
         };
         // A blob still being written keeps a fresh mtime.
         if !is_older_than(file, grace).await {
-            return;
+            return false;
         }
         let envelopes = self.envelopes.clone();
         let key = id.as_bytes().to_vec();
@@ -345,41 +616,7 @@ impl Storage {
             .ok()
             .and_then(Result::ok)
             .unwrap_or(true);
-        if !known {
-            let _ = fs::remove_file(file).await;
-        }
-    }
-
-    fn handles(&self) -> (Database, Keyspace, Keyspace, Keyspace) {
-        (
-            self.db.clone(),
-            self.envelopes.clone(),
-            self.by_time.clone(),
-            self.expiry.clone(),
-        )
-    }
-
-    async fn record_stats(&self, meta: &RequestMeta) {
-        let mut stats = self.stats.write().await;
-        let received_at = meta.received_at.into();
-        stats.prune_paths(received_at);
-
-        stats.total_requests += 1;
-        if meta.body.complete {
-            stats.complete_requests += 1;
-        } else {
-            stats.incomplete_requests += 1;
-        }
-        stats.stored_body_bytes = stats
-            .stored_body_bytes
-            .saturating_add(meta.body.stored_size);
-        let path_stats = stats.paths.entry(meta.path.clone()).or_insert(PathStats {
-            count: 0,
-            last_seen: received_at,
-        });
-        path_stats.count += 1;
-        path_stats.last_seen = received_at;
-        *stats.methods.entry(meta.method.clone()).or_default() += 1;
+        !known && fs::remove_file(file).await.is_ok()
     }
 }
 
@@ -425,6 +662,19 @@ fn search_blocking(
     Ok(page)
 }
 
+/// Best-effort mtime bump so the sweep sees the folder as in use.
+#[cfg(unix)]
+async fn touch_dir(dir: &Path) {
+    let dir = dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&dir).and_then(|f| f.set_modified(SystemTime::now()))
+    })
+    .await;
+}
+
+#[cfg(not(unix))]
+async fn touch_dir(_dir: &Path) {}
+
 fn time_key(meta: &RequestMeta) -> Vec<u8> {
     let received: SystemTime = meta.received_at.into();
     let path = meta.path.as_bytes();
@@ -453,15 +703,19 @@ fn expiry_key(expires_at: SystemTime, id: &str) -> Vec<u8> {
     key
 }
 
-/// `h1/h2` fan-out folders from an FNV-1a hash of the id: 65,536 leaf
-/// folders in total, however many distinct paths are captured.
+/// 4 hex characters from an FNV-1a hash of the id: 65,536 folders in one
+/// level, however many distinct paths are captured.
 fn fan_out(id: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in id.bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{:02x}/{:02x}", (hash >> 8) & 0xff, hash & 0xff)
+    format!("{:04x}", hash & 0xffff)
+}
+
+fn floor_to(secs: u64, width: u64) -> u64 {
+    secs - secs % width
 }
 
 fn epoch_nanos(time: SystemTime) -> u64 {
@@ -470,7 +724,7 @@ fn epoch_nanos(time: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn epoch_secs(time: SystemTime) -> u64 {
+pub fn epoch_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
@@ -484,39 +738,6 @@ async fn is_older_than(path: &Path, grace: Duration) -> bool {
             .unwrap_or(false),
         Err(_) => false,
     }
-}
-
-impl StatsAccumulator {
-    fn prune_paths(&mut self, now: SystemTime) {
-        self.paths.retain(|_, stats| {
-            now.duration_since(stats.last_seen)
-                .map(|age| age < PATH_STATS_IDLE_TTL)
-                .unwrap_or(true)
-        });
-        if self.paths.len() <= PATH_STATS_LIMIT {
-            return;
-        }
-
-        let mut oldest: Vec<_> = self
-            .paths
-            .iter()
-            .map(|(path, stats)| (path.clone(), stats.last_seen))
-            .collect();
-        oldest.sort_by_key(|(_, last_seen)| *last_seen);
-        for (path, _) in oldest
-            .into_iter()
-            .take(self.paths.len().saturating_sub(PATH_STATS_PRUNE_TARGET))
-        {
-            self.paths.remove(&path);
-        }
-    }
-}
-
-fn sorted_counts(map: BTreeMap<String, usize>, limit: usize) -> Vec<(String, usize)> {
-    let mut values: Vec<_> = map.into_iter().collect();
-    values.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    values.truncate(limit);
-    values
 }
 
 #[cfg(test)]
@@ -571,6 +792,14 @@ mod tests {
 
     fn later() -> SystemTime {
         SystemTime::now() + Duration::from_secs(3600)
+    }
+
+    /// Sets a path's mtime into the past, as if untouched for `age`.
+    fn age(path: &Path, age: Duration) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -648,6 +877,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn counts_are_bucketed_and_include_unflushed_requests() {
+        let tmp = TempDir::new().unwrap();
+        let storage = open(&tmp);
+        let now = Local::now();
+        let mut get = test_meta("g", "/x", now);
+        get.method = "GET".to_string();
+        let mut broken = test_meta("b", "/x", now);
+        broken.body.complete = false;
+        broken.body.original_size = 7;
+        let earlier = test_meta("e", "/x", now - chrono::Duration::hours(3));
+        for meta in [&get, &broken, &earlier] {
+            storage.put(meta, later()).await.unwrap();
+        }
+        let window = |hours| {
+            (
+                SystemTime::now() - Duration::from_secs(hours * HOUR),
+                SystemTime::now() + Duration::from_secs(60),
+            )
+        };
+
+        // Before a flush, counts come from memory.
+        let (from, to) = window(1);
+        let total = sum(&storage.counts(from, to, Granularity::Minute).await.unwrap());
+        assert_eq!(total.requests, 2);
+
+        storage.flush_stats().await.unwrap();
+        let total = sum(&storage.counts(from, to, Granularity::Minute).await.unwrap());
+        assert_eq!(total.requests, 2);
+        assert_eq!(total.complete, 1);
+        assert_eq!(total.incomplete, 1);
+        assert_eq!(total.body_bytes, 7);
+        assert_eq!(total.methods[0], 1); // GET
+        assert_eq!(total.methods[1], 1); // POST
+
+        // A second flush adds to the stored buckets.
+        storage
+            .put(&test_meta("again", "/x", Local::now()), later())
+            .await
+            .unwrap();
+        storage.flush_stats().await.unwrap();
+        let (from, to) = window(4);
+        let hours = storage.counts(from, to, Granularity::Hour).await.unwrap();
+        assert_eq!(sum(&hours).requests, 4);
+        assert!(hours.keys().all(|start| start % HOUR == 0));
+    }
+
+    fn sum(buckets: &BTreeMap<u64, Counts>) -> Counts {
+        let mut total = Counts::default();
+        for counts in buckets.values() {
+            total += *counts;
+        }
+        total
+    }
+
+    #[test]
+    fn counts_round_trip_through_bytes() {
+        let counts = Counts {
+            requests: 9,
+            complete: 5,
+            incomplete: 3,
+            limit_exceeded: 1,
+            body_bytes: 1 << 40,
+            methods: [1, 2, 3, 4, 5, 6],
+        };
+        assert_eq!(Counts::decode(&counts.encode()), counts);
+    }
+
+    #[tokio::test]
     async fn cleanup_removes_expired_envelopes_index_entries_and_blobs() {
         let tmp = TempDir::new().unwrap();
         let storage = open(&tmp);
@@ -677,7 +974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_removes_only_old_blobs_without_an_envelope() {
+    async fn sweep_removes_orphans_and_only_stale_empty_folders() {
         let tmp = TempDir::new().unwrap();
         let storage = open(&tmp);
         let mut config = config::Config::default();
@@ -696,24 +993,52 @@ mod tests {
         meta.body.object = Some(live.object.clone());
         storage.put(&meta, later()).await.unwrap();
 
-        // 16 passes cover all 256 top-level fan-out folders.
+        // A stale empty folder goes; a freshly touched one stays.
+        let stale = tmp.path().join("blobs/abcd");
+        let fresh = tmp.path().join("blobs/abce");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        age(&stale, EMPTY_DIR_GRACE + Duration::from_secs(60));
+
+        // 16 passes cover all 65,536 fan-out folders.
         for _ in 0..16 {
             storage.cleanup(&config).await.unwrap();
         }
         assert!(!orphan.path.exists());
         assert!(live.path.exists());
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        // The orphan's folder was just modified by the delete, so it stays.
+        assert!(orphan.path.parent().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn create_body_file_recreates_a_folder_removed_underneath_it() {
+        let tmp = TempDir::new().unwrap();
+        let storage = open(&tmp);
+        let location = storage.blob_location("id1", config::BodyMode::Raw).unwrap();
+        // The folder does not exist yet; creation makes it and the file.
+        drop(storage.create_body_file(&location).await.unwrap());
+        assert!(location.path.exists());
+
+        let second = storage.blob_location("id2", config::BodyMode::Raw).unwrap();
+        std::fs::remove_dir_all(second.path.parent().unwrap()).ok();
+        drop(storage.create_body_file(&second).await.unwrap());
+        assert!(second.path.exists());
     }
 
     #[test]
-    fn blob_locations_fan_out_by_id_and_reject_escapes() {
+    fn blob_locations_fan_out_one_level_and_reject_escapes() {
         let tmp = TempDir::new().unwrap();
         let storage = open(&tmp);
         let location = storage
             .blob_location("abc", config::BodyMode::Compressed)
             .unwrap();
         let parts: Vec<_> = location.object.split('/').collect();
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[2], "abc.body.bin.gz");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 4);
+        assert!(parts[0].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(parts[1], "abc.body.bin.gz");
         assert!(storage
             .blob_location("abc", config::BodyMode::MetadataOnly)
             .is_none());
@@ -731,59 +1056,5 @@ mod tests {
         let (_, path, id) = split_time_key(&key).unwrap();
         assert_eq!(path, b"/p/q");
         assert_eq!(id, b"id1");
-    }
-
-    #[tokio::test]
-    async fn path_counts_evict_after_seven_idle_days_and_restart() {
-        let tmp = TempDir::new().unwrap();
-        let storage = open(&tmp);
-
-        let old = Local::now() - chrono::Duration::from_std(PATH_STATS_IDLE_TTL).unwrap();
-        for i in 0..3 {
-            let meta = test_meta(&format!("old{i}"), "/old-id-path", old);
-            storage.put(&meta, later()).await.unwrap();
-        }
-        storage
-            .put(&test_meta("new1", "/new-path", Local::now()), later())
-            .await
-            .unwrap();
-        let stats = storage.dashboard().await.unwrap();
-        assert_eq!(stats.top_paths, vec![("/new-path".to_string(), 1)]);
-
-        storage
-            .put(
-                &test_meta("old-returned", "/old-id-path", Local::now()),
-                later(),
-            )
-            .await
-            .unwrap();
-        let stats = storage.dashboard().await.unwrap();
-        assert!(stats
-            .top_paths
-            .iter()
-            .any(|(path, count)| path == "/old-id-path" && *count == 1));
-    }
-
-    #[test]
-    fn path_stats_cap_prunes_least_recent_paths() {
-        let mut stats = StatsAccumulator::default();
-        let start = SystemTime::now();
-        for i in 0..=PATH_STATS_LIMIT {
-            stats.paths.insert(
-                format!("/path/{i}"),
-                PathStats {
-                    count: 1,
-                    last_seen: start + Duration::from_secs(i as u64),
-                },
-            );
-        }
-
-        stats.prune_paths(start + Duration::from_secs(PATH_STATS_LIMIT as u64));
-
-        assert_eq!(stats.paths.len(), PATH_STATS_PRUNE_TARGET);
-        assert!(!stats.paths.contains_key("/path/0"));
-        assert!(stats
-            .paths
-            .contains_key(&format!("/path/{PATH_STATS_LIMIT}")));
     }
 }

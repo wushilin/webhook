@@ -240,18 +240,22 @@ Per-path-prefix capture behavior. Each rule may override `ttl`, `body_mode`, `pr
 
 ## Storage layout
 
-Request metadata goes into a fjall database at `storage.db`, in three keyspaces:
+Request metadata goes into a fjall database at `storage.db`. Every read is a point lookup by id or a range over ordered keys with a fixed bound; nothing scans a whole keyspace. fjall is synchronous, so every call runs on Tokio's blocking thread pool, off the request-handling threads.
 
 | Keyspace | Key | Value | Used for |
 |---|---|---|---|
 | `envelopes` | request id | metadata JSON | detail pages, body lookups |
 | `by_time` | received time (ns) + path + id | — | newest-first search by time range and path prefix, reading keys only |
 | `expiry` | expiry time (s) + id | — | retention |
+| `stats_min` | minute start (s) | counts | overview ranges up to 24 hours (kept 2 days) |
+| `stats_hour` | hour start (s) | counts | overview ranges of 7 and 30 days (kept 90 days) |
 
-Bodies are written to `storage.blobs` as one file per request, named after the request id, in a fixed 256 × 256 fan-out of folders chosen by a hash of the id:
+Each counts bucket holds requests, complete, incomplete, limit exceeded, body bytes and a per-method breakdown. Captures add to an in-memory buffer that is written into the buckets every 5 seconds and at shutdown; the overview adds the unwritten part on top, so it is always current. A crash can lose at most the last few seconds of counts, never any requests.
+
+Bodies are written to `storage.blobs` as one file per request, named after the request id, in one level of 65,536 folders named by 4 hex characters of a hash of the id:
 
 ```text
-data/blobs/20/d2/20261012T082031.922460000Z_myhost_AbCdEf123456.body.bin.gz   # ".body.bin" in raw mode
+data/blobs/20d2/20261012T082031.922460000Z_myhost_AbCdEf123456.body.bin.gz   # ".body.bin" in raw mode
 ```
 
 Request ids start with the UTC capture time (`20261012T082031.922460000Z_<host>_<random>`), so they sort by time and are safe in URLs and file names. The metadata looks like:
@@ -268,7 +272,7 @@ Request ids start with the UTC capture time (`20261012T082031.922460000Z_<host>_
     "stored": true,
     "complete": true,
     "mode": "compressed",
-    "object": "20/d2/20261012T082031.922460000Z_myhost_AbCdEf123456.body.bin.gz",
+    "object": "20d2/20261012T082031.922460000Z_myhost_AbCdEf123456.body.bin.gz",
     "encoding": "gzip",
     "original_size": 28,
     "stored_size": 47,
@@ -280,7 +284,7 @@ Request ids start with the UTC capture time (`20261012T082031.922460000Z_<host>_
 }
 ```
 
-The body file is written as a stream and the metadata is committed once it is complete. If a client disconnects mid-body or an unknown-length body crosses `max_body_size`, the metadata records `complete = false` (and `limit_exceeded = true` in the latter case).
+Creating a body file is retried as a whole: create the folder, touch it (update its modification time), create the file; if any step fails, for example because cleanup removed the folder in between, all three are repeated, up to 5 times. The body is then written as a stream and the metadata is committed once it is complete. If a client disconnects mid-body or an unknown-length body crosses `max_body_size`, the metadata records `complete = false` (and `limit_exceeded = true` in the latter case).
 
 ## Large bodies
 
@@ -291,7 +295,12 @@ The body file is written as a stream and the metadata is committed once it is co
 
 At capture time the server resolves the path rule and records an expiry of `received_at + max(rule_ttl, min_ttl)` in the `expiry` index. Every `cleanup_interval`, cleanup reads that index from the start up to now and, for each expired request, deletes its body file and its database entries. The cost is proportional to the number of expired requests, not to how much is stored or how many distinct paths there are.
 
-Each pass also checks 16 of the 256 top-level blob folders for orphans: body files whose request id has no metadata and that have been untouched for `prune_grace`. Orphans only come from a crash between writing a body and committing its metadata. A full orphan sweep therefore takes 16 cleanup passes.
+Each pass also sweeps 4,096 of the 65,536 blob folders, so a full round takes 16 passes. In each folder it:
+
+- removes **orphan** body files: no matching metadata, and untouched for `prune_grace`. Orphans only come from a crash between writing a body and committing its metadata.
+- removes the folder itself if it is **empty and untouched for 30 minutes**. Deleting a body file updates its folder's modification time, and writers touch the folder before creating a file, so a folder in use never qualifies; a writer that loses the race anyway retries (see above).
+
+Old overview counts are dropped too: minute buckets after 2 days, hour buckets after 90 days.
 
 ## Admin UI
 
@@ -299,7 +308,7 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 
 | Route | Description |
 |---|---|
-| `/_wh_admin/` | Overview: counters since the server started, top 20 active paths (evicted after 7 days without a hit or past a 5k-path cap), plus the number of stored requests and the database size |
+| `/_wh_admin/` | Overview for the last 1 hour, 24 hours, 7 days or 30 days: requests, complete, incomplete, limit exceeded and body bytes, a requests-over-time chart (hover a column for its numbers, or *Show as table*), the method breakdown, and stored totals. Built from the counts buckets: at most 1,440 minute or 720 hour keys per view, and the counts survive restarts |
 | `/_wh_admin/requests` | Request explorer. Searches **everything retained**, newest first, by path prefix (`?path=`, a plain string prefix) and time range (quick ranges or a custom from/to in the server's time zone), 100 per page with an *Older* link. If a rare prefix doesn't fill a page within the scan budget, the page says how far back it searched and offers to keep going |
 | `/_wh_admin/requests/<id>` | Request detail: status, sizes, and Body / Headers / Query / Raw tabs. The body loads on demand (first 256KiB, then *Load all*) and is shown as formatted JSON, form fields, text or a hex dump. *Copy as cURL* rebuilds the request |
 | `/_wh_admin/requests/<id>/body` | The stored body, behind the admin login (same responses as the stream body endpoint below) |
@@ -353,7 +362,7 @@ Example (formatted here for readability; on the wire it is a single line):
   "headers": { "content-type": "application/json", "content-length": "11" },
   "body": {
     "stored": true, "complete": true, "mode": "compressed",
-    "object": "43/0e/20261012T011507.123456789Z_myhost_AbCdEfGhIjKl.body.bin.gz",
+    "object": "430e/20261012T011507.123456789Z_myhost_AbCdEfGhIjKl.body.bin.gz",
     "encoding": "gzip", "original_size": 11, "stored_size": 31,
     "content_type": "application/json", "previewable": true,
     "limit_exceeded": false, "error": null

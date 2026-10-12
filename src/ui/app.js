@@ -346,11 +346,42 @@
     }
   }
 
+  // Column chart tooltips: one floating box, filled with textContent, shown on
+  // hover and keyboard focus. The same numbers are in the chart's table view.
+  function initChart() {
+    const cols = document.querySelectorAll(".col[data-value]");
+    if (!cols.length) return;
+    const tip = el("div", "chart-tip");
+    tip.hidden = true;
+    document.body.append(tip);
+    const show = (col) => {
+      const strong = el("strong", null, col.dataset.value);
+      tip.replaceChildren(strong, el("span", null, col.dataset.title));
+      if (col.dataset.detail) tip.append(el("div", null, col.dataset.detail));
+      const box = col.getBoundingClientRect();
+      const bar = col.firstElementChild.getBoundingClientRect();
+      const half = tip.offsetWidth / 2 || 80;
+      const x = Math.min(Math.max(box.left + box.width / 2, half + 8), window.innerWidth - half - 8);
+      tip.style.left = x + "px";
+      tip.style.top = Math.min(bar.top, box.bottom - 4) + "px";
+      tip.hidden = false;
+    };
+    const hide = () => { tip.hidden = true; };
+    for (const col of cols) {
+      col.addEventListener("pointerenter", () => show(col));
+      col.addEventListener("focus", () => show(col));
+      col.addEventListener("pointerleave", hide);
+      col.addEventListener("blur", hide);
+    }
+    window.addEventListener("scroll", hide, { passive: true });
+  }
+
   window.WH = {
     el, button, humanBytes, fmtTime, methodChip, statusPill, bodyViewer, headersTable, copyText,
   };
   document.addEventListener("DOMContentLoaded", () => {
     initDetail();
     initResults();
+    initChart();
   });
 })();

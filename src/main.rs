@@ -92,7 +92,9 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-host".to_string());
 
-    let storage = Arc::new(Storage::open(&config.storage.db, &config.storage.blobs)?);
+    let storage = Arc::new(
+        Storage::open_async(config.storage.db.clone(), config.storage.blobs.clone()).await?,
+    );
 
     if config.stream.token.is_none() {
         warn!("stream.token is not configured; anyone can open the request stream");
@@ -111,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         retention_worker(cleanup_state).await;
     });
+    let flush_storage = storage.clone();
+    tokio::spawn(async move {
+        stats_flusher(flush_storage).await;
+    });
 
     let app = build_app(state);
 
@@ -125,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
+    if let Err(err) = storage.flush_stats().await {
+        warn!(error = ?err, "final stats flush failed");
+    }
     Ok(())
 }
 
@@ -162,6 +171,17 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+/// Writes buffered dashboard counts to the database every few seconds.
+async fn stats_flusher(storage: Arc<Storage>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        if let Err(err) = storage.flush_stats().await {
+            warn!(error = ?err, "stats flush failed");
+        }
     }
 }
 
