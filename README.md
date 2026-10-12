@@ -316,13 +316,13 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 | `/_wh_admin/requests/<id>/body` | The stored body, behind the admin login (same responses as the stream body endpoint below) |
 | `/_wh_admin/login`, `/logout` | Session login/logout (only when `admin.password` is set) |
 | `/_wh_admin/stream` | WebSocket stream of captured requests (see below) |
-| `/_wh_admin/streamview` | Live browser view of the stream (see below) |
+| `/_wh_admin/streamview` | Live browser view of the stream, with the stream token pre-filled (see below) |
 
 Paths that merely resemble the admin prefix (e.g. `/_wh_adminfoo`) are still captured as webhooks.
 
 ## Request stream
 
-`/_wh_admin/stream` is a WebSocket that pushes one JSON text message for each request captured after you connect. It uses `stream.token` rather than the admin login, sent as `Authorization: Bearer <token>` or `?token=<token>`. If `stream.token` is unset, the stream needs no token.
+`/_wh_admin/stream` is a WebSocket that pushes one JSON text message for each request captured after you connect. It is meant for clients and scripts that never log in, so it uses `stream.token` rather than the admin login, sent as `Authorization: Bearer <token>` or `?token=<token>`. If `stream.token` is unset, the stream needs no token.
 
 Every connection is an independent consumer that receives its own copy of every event. A slow consumer never holds up the others or the capture path. If a consumer falls more than `stream.buffer` events behind, it loses its oldest events. Events from before you connect are not replayed.
 
@@ -342,7 +342,9 @@ websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/str
 
 **Pause** only freezes the page. The WebSocket stays connected, and new requests wait in a banner until you resume. The page keeps the latest 500 cards and drops the oldest. It reconnects automatically if the connection drops.
 
-The page itself is served without the admin login, because it holds no data; everything it shows comes through the token-protected stream. You can prefill the form with `/_wh_admin/streamview?token=…&prefix=…`. The token is then removed from the address bar, and the page remembers the token and prefix in the browser's local storage.
+The page is behind the admin login like the rest of the UI. It is served with the configured `stream.token` already filled in, so it connects as soon as it opens; you can still read the token from the (masked) field to use in other clients. `?prefix=…` prefills the path filter, and the page remembers the last prefix in the browser's local storage.
+
+Only the `/stream` WebSocket and its body endpoint are reachable without logging in, and both require `stream.token`.
 
 ### Message format
 
@@ -412,8 +414,8 @@ The admin UI's stylesheet and scripts live in `src/ui/` and are compiled into th
 To cut a release, bump `version` in `Cargo.toml`, commit, then push a tag:
 
 ```sh
-git tag -a v0.2.0 -m "webhook 0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "webhook 0.2.1"
+git push origin v0.2.1
 ```
 
 ## License

@@ -123,9 +123,8 @@ pub async fn handle_admin(state: AppState, req: Request<Body>) -> Response {
             let id = decode_component(p.trim_start_matches("/stream/body/"));
             crate::stream::body(state, req, &id).await
         }
-        // A static shell: every event it shows comes through the token-gated stream.
-        "/streamview" => stream_view(&state),
         _ if !is_authorized(&state, req.headers()) => redirect(&format!("{prefix}/login")),
+        "/streamview" => stream_view(&state),
         "" | "/" => overview(state, req.uri().query()).await,
         "/requests" => requests(state, req.uri().query()).await,
         p if p.starts_with("/requests/") && p.ends_with("/body") => {
@@ -984,9 +983,15 @@ fn stream_view(state: &AppState) -> Response {
     } else {
         "false"
     };
+    // The page is behind the admin login, so it can carry the stream token
+    // and connect without the user typing it.
+    let token_js = serde_json::to_string(state.config.stream.token.as_deref().unwrap_or(""))
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c");
     let body = STREAM_VIEW
         .replace("__ADMIN_PREFIX__", &prefix_js)
-        .replace("__TOKEN_REQUIRED__", token_required);
+        .replace("__TOKEN_REQUIRED__", token_required)
+        .replace("__STREAM_TOKEN__", &token_js);
     page(
         state,
         "Live stream",

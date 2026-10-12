@@ -1210,12 +1210,39 @@ mod tests {
             config.stream.token = Some("tok".to_string());
         })
         .await;
-        let page = raw_http(
+        // Not logged in: the page sends you to the login form.
+        let anonymous = raw_http(
             server.addr,
             b"GET /_wh_admin/streamview HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
         )
         .await;
+        assert!(anonymous.starts_with("HTTP/1.1 303"), "{anonymous}");
+
+        let form = "username=admin&password=secret";
+        let login = raw_http(
+            server.addr,
+            format!(
+                "POST /_wh_admin/login HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/x-www-form-urlencoded\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{form}",
+                form.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+        let cookie = header_value(&login, "set-cookie")
+            .and_then(|value| value.split(';').next())
+            .expect("session cookie")
+            .to_string();
+        let page = raw_http(
+            server.addr,
+            format!(
+                "GET /_wh_admin/streamview HTTP/1.1\r\nhost: localhost\r\ncookie: {cookie}\r\nconnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
         assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        // Logged in: the stream token is pre-filled.
+        assert!(page.contains(r#"const STREAM_TOKEN = "tok";"#), "{page}");
         assert!(
             page.contains(r#"const ADMIN_PREFIX = "/_wh_admin";"#),
             "{page}"

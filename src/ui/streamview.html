@@ -32,6 +32,8 @@
   "use strict";
   const ADMIN_PREFIX = __ADMIN_PREFIX__;
   const TOKEN_REQUIRED = __TOKEN_REQUIRED__;
+  // Filled in by the server: this page is only served to logged-in admins.
+  const STREAM_TOKEN = __STREAM_TOKEN__;
   const MAX_CARDS = 500;
   const { el, humanBytes, fmtTime, methodChip, statusPill, bodyViewer, headersTable } = window.WH;
 
@@ -54,15 +56,10 @@
   let activePrefix = "", activeToken = "", prefixTimer = null;
   let paused = false, pending = [], dropped = 0, received = 0;
 
-  // ?token=&prefix= prefill the form; the token is then stripped from the address bar.
+  // The token comes from the server; ?prefix= prefills the filter.
   const params = new URLSearchParams(location.search);
-  els.token.value = params.get("token") ?? storage.get("wh.stream.token") ?? "";
+  els.token.value = STREAM_TOKEN;
   els.prefix.value = params.get("prefix") ?? storage.get("wh.stream.prefix") ?? "";
-  if (params.has("token")) {
-    params.delete("token");
-    const rest = params.toString();
-    history.replaceState(null, "", location.pathname + (rest ? "?" + rest : ""));
-  }
   if (!TOKEN_REQUIRED) els.token.placeholder = "Not required (stream.token is unset)";
 
   // ---------- connection ----------
@@ -132,7 +129,6 @@
 
   function connect() {
     clearTimeout(prefixTimer);
-    storage.set("wh.stream.token", els.token.value.trim());
     storage.set("wh.stream.prefix", currentPrefix());
     wanted = true;
     retry = 0;
