@@ -10,9 +10,10 @@ Useful for debugging third-party webhook integrations, inspecting what a client 
 - **Streamed body persistence** — bodies are written to disk as they arrive (never buffered whole in memory), optionally gzip-compressed, with configurable size limits.
 - **JSON metadata sidecar** — method, path, query, headers, timing, and body stats stored as JSON next to each body file.
 - **Path/time-partitioned storage layout** — records are laid out by request path and timestamp for easy `find`/`grep`.
-- **TTL-based retention** — captures write folder-level expiry markers; a background worker deletes expired folders, orphaned files, and empty folders on a schedule.
+- **Indexed storage** — request metadata lives in an embedded [fjall](https://github.com/fjall-rs/fjall) database indexed by time and path; bodies are files in a fixed hashed fan-out of folders. Search, detail lookups and retention never walk a directory tree.
+- **TTL-based retention** — an expiry index lets cleanup delete exactly the requests that have expired, however many paths you capture.
 - **Configurable responses** — global and per-path-prefix response status, headers, and body (capture metadata JSON, static text, or static JSON).
-- **Admin UI** — dashboard, bounded recent-request list with path filtering, and request detail pages with body preview, protected by an optional login (bcrypt password, in-memory sessions).
+- **Admin UI** — overview, a request explorer that searches everything retained by path prefix and time range, request detail pages with a formatted body viewer and *Copy as cURL*, and a live stream view. Protected by an optional login (bcrypt password, in-memory sessions). Light and dark themes.
 - **Safe filesystem mapping** — URL path segments are reversibly percent-encoded for filesystem use; the original path is always preserved verbatim in metadata.
 
 ## Quick start
@@ -104,14 +105,15 @@ password = "$2b$12$..."
 
 [storage]
 backend = "local"              # only "local" is implemented
-root = "./data"                # storage root directory
+db = "./data/db"               # request database; keep it on a local disk, not NFS
+blobs = "./data/blobs"         # body files; may be on NFS
 
 [retention]
 default_ttl = "30d"            # how long records are kept
 min_ttl = "2h"                 # shorter per-path TTLs are raised to this floor
 cleanup_interval = "1h"        # how often the cleanup worker runs
-prune_grace = "1h"             # empty folders / orphaned files are only removed
-                               # once untouched this long
+prune_grace = "1h"             # orphaned body files are only removed once
+                               # untouched this long
 
 [body]
 mode = "compressed"            # compressed | raw | metadata_only
@@ -198,7 +200,10 @@ $ webhook verifypassword
 | Key | Default | Description |
 |---|---|---|
 | `backend` | `local` | Storage backend (only `local` is implemented) |
-| `root` | `./data` | Directory where captures are stored |
+| `db` | `./data/db` | Request database (metadata and indexes). Put it on a **local disk**: embedded databases rely on file locking and fsync behaviour that NFS doesn't provide |
+| `blobs` | `./data/blobs` | Body files. Can live on NFS. Created on startup if missing |
+
+`storage.root` from older versions is no longer accepted; startup fails with a message pointing at `db` and `blobs`.
 
 ### `[retention]`
 
@@ -207,7 +212,7 @@ $ webhook verifypassword
 | `default_ttl` | `30d` | Records older than this are deleted (overridable per `[[paths]]` rule) |
 | `min_ttl` | `2h` | Minimum effective TTL; shorter configured TTLs are coalesced to this value |
 | `cleanup_interval` | `1h` | How often the cleanup worker runs |
-| `prune_grace` | `1h` | Orphaned files and empty folders are only removed once untouched this long |
+| `prune_grace` | `1h` | A body file with no matching request (left by a crash mid-capture) is only removed once untouched this long |
 
 ### `[body]`
 
@@ -235,21 +240,26 @@ Per-path-prefix capture behavior. Each rule may override `ttl`, `body_mode`, `pr
 
 ## Storage layout
 
-For `POST /test1/test2/test3?aaafe=afafw` received at 16:20:31, local storage writes:
+Request metadata goes into a fjall database at `storage.db`, in three keyspaces:
+
+| Keyspace | Key | Value | Used for |
+|---|---|---|---|
+| `envelopes` | request id | metadata JSON | detail pages, body lookups |
+| `by_time` | received time (ns) + path + id | — | newest-first search by time range and path prefix, reading keys only |
+| `expiry` | expiry time (s) + id | — | retention |
+
+Bodies are written to `storage.blobs` as one file per request, named after the request id, in a fixed 256 × 256 fan-out of folders chosen by a hash of the id:
 
 ```text
-data/test1/test2/test3/2026/07/15/16/20/31/
-  .expires_at                                           # Unix epoch seconds for folder expiry
-  31_922460000_myhost_AbCdEf1234567890.json          # metadata
-  31_922460000_myhost_AbCdEf1234567890.body.bin.gz   # body (".body.bin" in raw mode)
+data/blobs/20/d2/20261012T082031.922460000Z_myhost_AbCdEf123456.body.bin.gz   # ".body.bin" in raw mode
 ```
 
-The metadata JSON looks like:
+Request ids start with the UTC capture time (`20261012T082031.922460000Z_<host>_<random>`), so they sort by time and are safe in URLs and file names. The metadata looks like:
 
 ```json
 {
-  "id": "31_922460000_myhost_AbCdEf1234567890",
-  "received_at": "2026-07-15T16:20:31.922460+08:00",
+  "id": "20261012T082031.922460000Z_myhost_AbCdEf123456",
+  "received_at": "2026-10-12T16:20:31.922460+08:00",
   "method": "POST",
   "path": "/test1/test2/test3",
   "query": "aaafe=afafw",
@@ -258,7 +268,7 @@ The metadata JSON looks like:
     "stored": true,
     "complete": true,
     "mode": "compressed",
-    "object": "31_922460000_myhost_AbCdEf1234567890.body.bin.gz",
+    "object": "20/d2/20261012T082031.922460000Z_myhost_AbCdEf123456.body.bin.gz",
     "encoding": "gzip",
     "original_size": 28,
     "stored_size": 47,
@@ -270,9 +280,7 @@ The metadata JSON looks like:
 }
 ```
 
-Path segments are URL-decoded and then reversibly percent-encoded for filesystem safety. Ordinary readable characters, including Unicode, are kept. Literal `%`, path separators inside encoded segments, control characters, Windows-forbidden characters, `.` / `..`, trailing dot/space, and Windows device names are escaped. The original request path is always preserved verbatim in the metadata.
-
-The body file is written as a stream. If a client disconnects mid-body or an unknown-length body crosses `max_body_size`, the metadata records `complete = false` (and `limit_exceeded = true` in the latter case).
+The body file is written as a stream and the metadata is committed once it is complete. If a client disconnects mid-body or an unknown-length body crosses `max_body_size`, the metadata records `complete = false` (and `limit_exceeded = true` in the latter case).
 
 ## Large bodies
 
@@ -281,7 +289,9 @@ The body file is written as a stream. If a client disconnects mid-body or an unk
 
 ## Retention and cleanup
 
-At capture time, the server resolves the path rule, applies `max(rule_ttl, min_ttl)`, and writes a `.expires_at` marker into the second-level capture folder. Every `cleanup_interval`, cleanup streams through the storage tree, deletes folders whose marker is expired without opening each metadata JSON, and prunes empty parent folders after their children are gone. It separately sweeps garbage such as stale `*.json.tmp`, stale `.expires_at.*.tmp`, and body files whose metadata was never written; that garbage sweep only touches files and folders untouched for `prune_grace`.
+At capture time the server resolves the path rule and records an expiry of `received_at + max(rule_ttl, min_ttl)` in the `expiry` index. Every `cleanup_interval`, cleanup reads that index from the start up to now and, for each expired request, deletes its body file and its database entries. The cost is proportional to the number of expired requests, not to how much is stored or how many distinct paths there are.
+
+Each pass also checks 16 of the 256 top-level blob folders for orphans: body files whose request id has no metadata and that have been untouched for `prune_grace`. Orphans only come from a crash between writing a body and committing its metadata. A full orphan sweep therefore takes 16 cleanup passes.
 
 ## Admin UI
 
@@ -289,34 +299,23 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 
 | Route | Description |
 |---|---|
-| `/_wh_admin/` | Dashboard with in-memory counters since process start and top 20 active paths; per-path counts evict after 7 days without a hit or when the 5k active-path cap is exceeded, then restart from 1 when seen again |
-| `/_wh_admin/requests` | Last 5000 requests since process start, filterable by path |
-| `/_wh_admin/requests/<id>` | Request detail with headers and body preview for requests still in the recent-request buffer |
+| `/_wh_admin/` | Overview: counters since the server started, top 20 active paths (evicted after 7 days without a hit or past a 5k-path cap), plus the number of stored requests and the database size |
+| `/_wh_admin/requests` | Request explorer. Searches **everything retained**, newest first, by path prefix (`?path=`, a plain string prefix) and time range (quick ranges or a custom from/to in the server's time zone), 100 per page with an *Older* link. If a rare prefix doesn't fill a page within the scan budget, the page says how far back it searched and offers to keep going |
+| `/_wh_admin/requests/<id>` | Request detail: status, sizes, and Body / Headers / Query / Raw tabs. The body loads on demand (first 256KiB, then *Load all*) and is shown as formatted JSON, form fields, text or a hex dump. *Copy as cURL* rebuilds the request |
+| `/_wh_admin/requests/<id>/body` | The stored body, behind the admin login (same responses as the stream body endpoint below) |
 | `/_wh_admin/login`, `/logout` | Session login/logout (only when `admin.password` is set) |
 | `/_wh_admin/stream` | WebSocket stream of captured requests (see below) |
 | `/_wh_admin/streamview` | Live browser view of the stream (see below) |
 
 Paths that merely resemble the admin prefix (e.g. `/_wh_adminfoo`) are still captured as webhooks.
 
-## Request stream
-
-`/_wh_admin/stream` is a WebSocket that pushes one JSON text message for each request captured after you connect. It uses `stream.token` rather than the admin login, sent as `Authorization: Bearer <token>` or `?token=<token>`. If `stream.token` is unset, the stream needs no token.
-
-Every connection is an independent consumer that receives its own copy of every event. A slow consumer never holds up the others or the capture path. If a consumer falls more than `stream.buffer` events behind, it loses its oldest events. Events from before you connect are not replayed.
-
-Add `?prefix=/api/v1` to receive only requests whose path starts with `/api/v1`. This is a plain string match, so `/api/v1` also matches `/api/v1x`; use `/api/v1/` to match only paths under `/api/v1/`. A leading `/` is added if you leave it out.
-
-```sh
-websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/stream?prefix=/api/v1'
-```
-
 ### Live view
 
 `/_wh_admin/streamview` shows the stream in the browser. Enter the stream token and an optional path prefix, and new requests appear on top as cards. Click a card to expand it and see:
 
-- **Summary:** size, content type and request id.
+- **Summary:** size and receive time, with a link to the full request page.
 - **Body:** fetched from the body endpoint only when you expand the card, first 256KiB, with a **Load all** button for the rest. It's shown as pretty-printed JSON, a form field list, plain text, or a hex dump for binary bodies, with buttons to copy or download it.
-- **Headers and raw event:** every header, plus the raw JSON event.
+- **Headers:** every header.
 
 **Pause** only freezes the page. The WebSocket stays connected, and new requests wait in a banner until you resume. The page keeps the latest 500 cards and drops the oldest. It reconnects automatically if the connection drops.
 
@@ -325,7 +324,7 @@ The page itself is served without the admin login, because it holds no data; eve
 ### Message format
 
 - **One request, one message.** Each captured request is sent as exactly one WebSocket **text** message containing one UTF-8 JSON object: an envelope with the request metadata. **Bodies are never sent over the stream.** Fetch them from `body_url` when you need them, so a burst of large requests costs the stream almost nothing.
-- **Ordering.** Messages arrive in the order the requests finished being captured. A message is sent only after that request's body file and metadata JSON have been written, so `body_url` is ready to fetch as soon as the message arrives.
+- **Ordering.** Messages arrive in the order the requests finished being captured. A message is sent only after that request's body file and metadata have been written, so `body_url` is ready to fetch as soon as the message arrives.
 - **Client to server.** Anything the client sends is ignored, apart from Close. Pings are answered automatically.
 - **Shutdown.** When the server shuts down, it sends a Close frame.
 
@@ -346,7 +345,7 @@ Example (formatted here for readability; on the wire it is a single line):
 
 ```json
 {
-  "id": "07_123456789_myhost_AbCdEfGhIjKlMnOp",
+  "id": "20261012T011507.123456789Z_myhost_AbCdEfGhIjKl",
   "received_at": "2026-10-12T09:15:07.123456789+08:00",
   "method": "POST",
   "path": "/api/v1/hook",
@@ -354,12 +353,12 @@ Example (formatted here for readability; on the wire it is a single line):
   "headers": { "content-type": "application/json", "content-length": "11" },
   "body": {
     "stored": true, "complete": true, "mode": "compressed",
-    "object": "07_123456789_myhost_AbCdEfGhIjKlMnOp.body.bin.gz",
+    "object": "43/0e/20261012T011507.123456789Z_myhost_AbCdEfGhIjKl.body.bin.gz",
     "encoding": "gzip", "original_size": 11, "stored_size": 31,
     "content_type": "application/json", "previewable": true,
     "limit_exceeded": false, "error": null
   },
-  "body_url": "/_wh_admin/stream/body/YXBpL3YxL2hvb2svMjAyNi8xMC8xMi8wOS8xNS8wNy8wN18xMjM0NTY3ODlfbXlob3N0X0FiQ2RFZkdoSWpLbE1uT3AuYm9keS5iaW4uZ3o"
+  "body_url": "/_wh_admin/stream/body/20261012T011507.123456789Z_myhost_AbCdEfGhIjKl"
 }
 ```
 
@@ -367,10 +366,10 @@ Example (formatted here for readability; on the wire it is a single line):
 
 `GET <body_url>` returns the original, uncompressed body as stored on disk. It uses the same token rules as the stream (`Authorization: Bearer <token>` or `?token=`).
 
-- **Reference:** the last part of `body_url` is the body file's location under `storage.root`, base64url-encoded. It works for as long as the request is retained (`retention.default_ttl`), not only while it's in the live stream. The server rejects any reference that would point outside the storage root.
+- **Lookup:** the last part of `body_url` is the request id. It works for as long as the request is retained (`retention.default_ttl`), not only while it's in the live stream.
 - **`?limit=N`:** returns only the first N bytes of the body. Without it you get the whole body, streamed from disk and gunzipped on the fly, so even large bodies aren't buffered in memory.
 - **Response:** always `application/octet-stream` with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so a captured HTML or script body can never run on the admin origin. Use `body.content_type` from the envelope for the original type.
-- **Errors:** 401 for a missing or wrong token, 404 when the reference is invalid or the body has expired.
+- **Errors:** 401 for a missing or wrong token, 404 for an unknown id, a request without a stored body, or an expired one.
 - **Partial bodies:** for incomplete or limit-exceeded requests you get exactly what was stored, which can be shorter than `body.original_size`.
 
 ```sh

@@ -4,21 +4,38 @@ use axum::{
     http::{header, HeaderMap, Method, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use flate2::read::GzDecoder;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{Local, NaiveDateTime, TimeZone};
 use rand::{distributions::Alphanumeric, Rng};
 use std::{
     collections::HashMap,
-    io::Read,
     sync::Mutex,
     time::{Duration, SystemTime},
 };
 
-use crate::{models::RequestMeta, storage::RequestRecord, AppState};
+use crate::{
+    models::RequestMeta,
+    storage::{SearchPage, SearchQuery},
+    AppState,
+};
 
 const SESSION_COOKIE: &str = "wh_admin_session";
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOGIN_FORM_LIMIT: usize = 16 * 1024;
-const STREAM_VIEW: &str = include_str!("streamview.html");
+const PAGE_SIZE: usize = 100;
+/// Index keys examined per results page; keys are small, so this is fast.
+const SCAN_BUDGET: usize = 200_000;
+const STYLE_CSS: &str = include_str!("ui/style.css");
+const APP_JS: &str = include_str!("ui/app.js");
+const STREAM_VIEW: &str = include_str!("ui/streamview.html");
+/// Quick time ranges on the requests page.
+const RANGES: [(&str, &str, u64); 5] = [
+    ("15m", "15 min", 15 * 60),
+    ("1h", "1 hour", 60 * 60),
+    ("24h", "24 hours", 24 * 60 * 60),
+    ("7d", "7 days", 7 * 24 * 60 * 60),
+    ("all", "All", 0),
+];
 
 #[derive(Debug, Default)]
 pub struct Sessions {
@@ -89,7 +106,8 @@ pub async fn handle_admin(state: AppState, req: Request<Body>) -> Response {
     let method = req.method().clone();
 
     match subpath.as_str() {
-        "/style.css" => css(),
+        "/style.css" => asset("text/css; charset=utf-8", STYLE_CSS),
+        "/app.js" => asset("text/javascript; charset=utf-8", APP_JS),
         "/login" if method == Method::GET => {
             if is_authorized(&state, req.headers()) {
                 redirect(&format!("{prefix}/"))
@@ -102,16 +120,21 @@ pub async fn handle_admin(state: AppState, req: Request<Body>) -> Response {
         // Authenticated by stream.token rather than the admin session.
         "/stream" => crate::stream::handle(state, req).await,
         p if p.starts_with("/stream/body/") => {
-            let body_ref = p.trim_start_matches("/stream/body/").to_string();
-            crate::stream::body(state, req, &body_ref).await
+            let id = decode_component(p.trim_start_matches("/stream/body/"));
+            crate::stream::body(state, req, &id).await
         }
         // A static shell: every event it shows comes through the token-gated stream.
         "/streamview" => stream_view(&state),
         _ if !is_authorized(&state, req.headers()) => redirect(&format!("{prefix}/login")),
-        "" | "/" => dashboard(state).await,
+        "" | "/" => overview(state).await,
         "/requests" => requests(state, req.uri().query()).await,
+        p if p.starts_with("/requests/") && p.ends_with("/body") => {
+            let id = decode_component(p.trim_start_matches("/requests/").trim_end_matches("/body"));
+            let query = req.uri().query().map(parse_form).unwrap_or_default();
+            crate::stream::serve_body(&state, &id, &query).await
+        }
         p if p.starts_with("/requests/") => {
-            request_detail(state, p.trim_start_matches("/requests/")).await
+            request_detail(state, &decode_component(p.trim_start_matches("/requests/"))).await
         }
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
@@ -240,232 +263,516 @@ fn decode_component(raw: &str) -> String {
         .unwrap_or(plus_decoded)
 }
 
-async fn dashboard(state: AppState) -> Response {
-    match state.storage.dashboard().await {
-        Ok(stats) => {
-            let path_rows = if stats.top_paths.is_empty() {
-                r#"<tr><td colspan="2" class="empty">No requests captured yet.</td></tr>"#
-                    .to_string()
-            } else {
-                stats
-                    .top_paths
-                    .iter()
-                    .map(|(path, count)| {
-                        format!(
-                            "<tr><td><a href=\"{}/requests?path={}\">{}</a></td><td class=\"num\">{}</td></tr>",
-                            state.config.server.admin_prefix,
-                            urlencoding::encode(path),
-                            escape(path),
-                            count
-                        )
-                    })
-                    .collect::<String>()
-            };
-            let method_rows = if stats.top_methods.is_empty() {
-                r#"<tr><td colspan="2" class="empty">No requests captured yet.</td></tr>"#
-                    .to_string()
-            } else {
-                stats
-                    .top_methods
-                    .iter()
-                    .map(|(method, count)| {
-                        format!(
-                            "<tr><td>{}</td><td class=\"num\">{}</td></tr>",
-                            method_chip(method),
-                            count
-                        )
-                    })
-                    .collect::<String>()
-            };
+// ---------- overview ----------
 
-            page(
-                &state,
-                "Dashboard",
-                "dashboard",
-                &format!(
-                    r#"
+async fn overview(state: AppState) -> Response {
+    let stats = match state.storage.dashboard().await {
+        Ok(stats) => stats,
+        Err(err) => return error_response(err),
+    };
+    let prefix = admin_prefix(&state);
+    let top = stats
+        .top_paths
+        .first()
+        .map_or(1, |(_, count)| *count)
+        .max(1);
+    let path_rows = if stats.top_paths.is_empty() {
+        r#"<tr><td colspan="2" class="empty">No requests captured since the server started.</td></tr>"#
+            .to_string()
+    } else {
+        stats
+            .top_paths
+            .iter()
+            .map(|(path, count)| {
+                format!(
+                    r#"<tr><td class="bar-cell mono"><span class="bar" style="width:{width}%"></span><a href="{prefix}/requests?path={path_q}">{path}</a></td><td class="num">{count}</td></tr>"#,
+                    width = count * 100 / top,
+                    path_q = urlencoding::encode(path),
+                    path = escape(path),
+                )
+            })
+            .collect()
+    };
+    let method_rows = if stats.top_methods.is_empty() {
+        r#"<tr><td colspan="2" class="empty">Nothing yet.</td></tr>"#.to_string()
+    } else {
+        stats
+            .top_methods
+            .iter()
+            .map(|(method, count)| {
+                format!(
+                    r#"<tr><td>{}</td><td class="num">{count}</td></tr>"#,
+                    method_chip(method)
+                )
+            })
+            .collect()
+    };
+
+    let body = format!(
+        r#"<div class="section-label">Since the server started</div>
 <section class="metrics">
-  <div class="tile"><span>Requests since restart</span><b>{}</b></div>
-  <div class="tile"><span>Complete</span><b>{}</b></div>
-  <div class="tile"><span>Incomplete</span><b>{}</b></div>
-  <div class="tile"><span>Stored body</span><b>{}</b></div>
+  <div class="tile"><span>Requests</span><b>{total}</b></div>
+  <div class="tile"><span>Complete</span><b>{complete}</b></div>
+  <div class="tile"><span>Incomplete</span><b>{incomplete}</b></div>
+  <div class="tile"><span>Body data received</span><b>{bytes}</b></div>
+</section>
+<div class="section-label">Stored</div>
+<section class="metrics">
+  <div class="tile"><span>Requests kept</span><b>{stored}</b><small>approximate</small></div>
+  <div class="tile"><span>Database on disk</span><b>{db}</b><small>metadata, indexes and journal</small></div>
+  <div class="tile"><span>Retention</span><b>{ttl}</b><small>default; per-path rules may differ</small></div>
 </section>
 <section class="grid">
-  <div class="card">
-    <h2>Top 20 active paths (7d idle TTL, 5k cap)</h2>
-    <table><thead><tr><th>Path</th><th class="num">Requests</th></tr></thead><tbody>{}</tbody></table>
+  <div class="card flush">
+    <div class="card-head" style="padding:14px 16px 0"><h2>Most active paths</h2><a href="{prefix}/requests">Search requests &rarr;</a></div>
+    <table><thead><tr><th>Path</th><th class="num">Requests</th></tr></thead><tbody>{path_rows}</tbody></table>
   </div>
-  <div class="card">
-    <h2>Methods</h2>
-    <table><thead><tr><th>Method</th><th class="num">Requests</th></tr></thead><tbody>{}</tbody></table>
+  <div class="card flush">
+    <div class="card-head" style="padding:14px 16px 0"><h2>Methods</h2></div>
+    <table><thead><tr><th>Method</th><th class="num">Requests</th></tr></thead><tbody>{method_rows}</tbody></table>
   </div>
-</section>
-"#,
-                    stats.total_requests,
-                    stats.complete_requests,
-                    stats.incomplete_requests,
-                    human_bytes(stats.stored_body_bytes),
-                    path_rows,
-                    method_rows
-                ),
-            )
+</section>"#,
+        total = stats.total_requests,
+        complete = stats.complete_requests,
+        incomplete = stats.incomplete_requests,
+        bytes = human_bytes(stats.stored_body_bytes),
+        stored = stats.stored_requests,
+        db = human_bytes(stats.db_disk_bytes),
+        ttl = short_duration(state.config.retention.default_ttl),
+    );
+    page(
+        &state,
+        "Overview",
+        Some("Traffic since the last restart, and what is kept on disk."),
+        "overview",
+        "",
+        &body,
+    )
+}
+
+// ---------- requests explorer ----------
+
+/// Parsed `/requests` query string, re-encodable for links.
+#[derive(Default, Clone)]
+struct Filters {
+    path: String,
+    range: String,
+    from: String,
+    to: String,
+}
+
+impl Filters {
+    fn parse(query: Option<&str>) -> (Self, Option<String>) {
+        let form = query.map(parse_form).unwrap_or_default();
+        let get = |name| {
+            form_value(&form, name)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let mut filters = Self {
+            path: get("path"),
+            range: get("range"),
+            from: get("from"),
+            to: get("to"),
+        };
+        if !filters.path.is_empty() && !filters.path.starts_with('/') {
+            filters.path.insert(0, '/');
         }
-        Err(err) => error_response(err),
+        let custom = !filters.from.is_empty() || !filters.to.is_empty();
+        if custom {
+            filters.range = "custom".to_string();
+        } else if !RANGES.iter().any(|(key, _, _)| *key == filters.range) {
+            filters.range = "all".to_string();
+        }
+        (
+            filters,
+            form_value(&form, "before").filter(|b| !b.is_empty()),
+        )
     }
+
+    fn url(&self, prefix: &str, overrides: &[(&str, &str)]) -> String {
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("path", &self.path),
+            ("range", &self.range),
+            ("from", &self.from),
+            ("to", &self.to),
+        ];
+        for (key, value) in overrides {
+            match pairs.iter_mut().find(|(k, _)| k == key) {
+                Some(pair) => pair.1 = value,
+                None => pairs.push((key, value)),
+            }
+        }
+        let query: Vec<String> = pairs
+            .iter()
+            .filter(|(k, v)| !v.is_empty() && !(*k == "range" && (*v == "all" || *v == "custom")))
+            .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+            .collect();
+        if query.is_empty() {
+            format!("{prefix}/requests")
+        } else {
+            format!("{prefix}/requests?{}", query.join("&"))
+        }
+    }
+
+    fn window(&self) -> (Option<SystemTime>, Option<SystemTime>) {
+        if self.range == "custom" {
+            return (parse_local_time(&self.from), parse_local_time(&self.to));
+        }
+        let secs = RANGES
+            .iter()
+            .find(|(key, _, _)| *key == self.range)
+            .map_or(0, |(_, _, secs)| *secs);
+        let from = (secs > 0).then(|| SystemTime::now() - Duration::from_secs(secs));
+        (from, None)
+    }
+}
+
+/// `datetime-local` input values, in the server's time zone.
+fn parse_local_time(value: &str) -> Option<SystemTime> {
+    let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))
+        .ok()?;
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(SystemTime::from)
 }
 
 async fn requests(state: AppState, query: Option<&str>) -> Response {
-    let path_filter = query
-        .map(parse_form)
-        .and_then(|form| form_value(&form, "path"))
-        .filter(|value| !value.is_empty());
-
-    match state.storage.recent(200, path_filter.as_deref()).await {
-        Ok(records) => {
-            let rows = if records.is_empty() {
-                r#"<tr><td colspan="5" class="empty">No requests matched.</td></tr>"#.to_string()
-            } else {
-                records
-                    .iter()
-                    .map(|record| request_row(&state, record))
-                    .collect::<String>()
-            };
-            let title = path_filter
-                .as_ref()
-                .map(|p| format!("Requests for {p}"))
-                .unwrap_or_else(|| "Recent requests".to_string());
-            page(
-                &state,
-                &title,
-                "requests",
-                &format!(
-                    r#"<div class="toolbar"><form method="get"><input name="path" placeholder="Filter by path, e.g. /api1" value="{}"><button>Filter</button></form></div>
-<div class="card"><table><thead><tr><th>Time</th><th>Method</th><th>Path</th><th class="num">Body</th><th>Status</th></tr></thead><tbody>{}</tbody></table></div>"#,
-                    escape(path_filter.as_deref().unwrap_or("")),
-                    rows
-                ),
-            )
-        }
-        Err(err) => error_response(err),
-    }
-}
-
-async fn request_detail(state: AppState, id: &str) -> Response {
-    match state.storage.find_by_id(id).await {
-        Ok(Some(record)) => {
-            let meta_json =
-                serde_json::to_string_pretty(&record.meta).unwrap_or_else(|_| "{}".to_string());
-            let preview = body_preview(&record).await;
-            page(
-                &state,
-                &format!("Request {}", escape(&record.meta.id)),
-                "requests",
-                &format!(
-                    r#"<p class="backlink"><a href="{}/requests">&larr; All requests</a></p>
-<section class="detail card">
-<div class="summary">
-  <div><span>Method</span><b>{}</b></div>
-  <div><span>Path</span><b>{}</b></div>
-  <div><span>Received</span><b>{}</b></div>
-  <div><span>Body</span><b>{}</b></div>
-  <div><span>Metadata file</span><b>{}</b></div>
-</div>
-<h2>Body preview</h2>
-{}
-<h2>Metadata</h2>
-<pre>{}</pre>
-</section>"#,
-                    state.config.server.admin_prefix,
-                    method_chip(&record.meta.method),
-                    escape(&record.meta.path),
-                    escape(&record.meta.received_at.to_rfc3339()),
-                    body_status(&record.meta),
-                    escape(&record.meta_path.display().to_string()),
-                    preview,
-                    escape(&meta_json)
-                ),
-            )
-        }
-        Ok(None) => (StatusCode::NOT_FOUND, "request not found").into_response(),
-        Err(err) => error_response(err),
-    }
-}
-
-async fn body_preview(record: &RequestRecord) -> String {
-    if !record.meta.body.previewable {
-        return "<p class=\"muted\">Body preview is unavailable for this request.</p>".to_string();
-    }
-    let Some(path) = &record.body_path else {
-        return "<p class=\"muted\">No body object was stored.</p>".to_string();
+    let prefix = admin_prefix(&state);
+    let (filters, before) = Filters::parse(query);
+    let (from, to) = filters.window();
+    let cursor = before
+        .as_deref()
+        .and_then(|b| URL_SAFE_NO_PAD.decode(b).ok());
+    let search = SearchQuery {
+        prefix: (!filters.path.is_empty()).then(|| filters.path.clone()),
+        from,
+        to,
+        before: cursor.clone(),
+        limit: PAGE_SIZE,
+        scan_budget: SCAN_BUDGET,
     };
-    match tokio::fs::read(path).await {
-        Ok(bytes) => {
-            let decoded = if record.meta.body.encoding.as_deref() == Some("gzip") {
-                let original_size = record.meta.body.original_size as usize;
-                let inflated = tokio::task::spawn_blocking(move || {
-                    let mut decoder = GzDecoder::new(bytes.as_slice());
-                    let mut out = Vec::with_capacity(original_size);
-                    decoder.read_to_end(&mut out).map(|_| out)
-                })
-                .await;
-                match inflated {
-                    Ok(Ok(out)) => out,
-                    Ok(Err(err)) => {
-                        return format!(
-                            "<p class=\"error\">Failed to decompress body: {}</p>",
-                            escape(&err.to_string())
-                        );
-                    }
-                    Err(err) => {
-                        return format!(
-                            "<p class=\"error\">Failed to decompress body: {}</p>",
-                            escape(&err.to_string())
-                        );
-                    }
-                }
+    let page_data = match state.storage.search(search).await {
+        Ok(page) => page,
+        Err(err) => return error_response(err),
+    };
+
+    let range_links: String = RANGES
+        .iter()
+        .map(|(key, label, _)| {
+            format!(
+                r#"<a href="{}" class="{}">{label}</a>"#,
+                escape(&filters.url(&prefix, &[("range", key), ("from", ""), ("to", "")])),
+                if filters.range == *key { "active" } else { "" },
+            )
+        })
+        .collect();
+    let custom = filters.range == "custom";
+
+    let filter_bar = format!(
+        r#"<form class="filters" method="get" action="{prefix}/requests">
+  <label class="grow">Path prefix
+    <input name="path" value="{path}" placeholder="All paths, or e.g. /api/v1" spellcheck="false" autocomplete="off">
+  </label>
+  <input type="hidden" name="range" value="{range}">
+  <label>Time range <span class="ranges">{range_links}</span></label>
+  <label>From <input type="datetime-local" name="from" value="{from}" step="1"></label>
+  <label>To <input type="datetime-local" name="to" value="{to}" step="1"></label>
+  <button type="submit">Search</button>
+  {reset}
+</form>"#,
+        path = escape(&filters.path),
+        range = if custom { "" } else { filters.range.as_str() },
+        from = escape(&filters.from),
+        to = escape(&filters.to),
+        reset = if filters.path.is_empty() && filters.range == "all" {
+            String::new()
+        } else {
+            format!(r#"<a class="button secondary" href="{prefix}/requests">Reset</a>"#)
+        },
+    );
+
+    let notice = if page_data.budget_exhausted {
+        format!(
+            r#"<div class="notice">Searched back to {} without filling the page. <a class="button secondary small" href="{}">Keep searching</a></div>"#,
+            page_data
+                .scanned_back_to
+                .map(format_system_time)
+                .unwrap_or_else(|| "the start".to_string()),
+            escape(&next_url(&filters, &prefix, &page_data)),
+        )
+    } else {
+        String::new()
+    };
+
+    let rows = if page_data.records.is_empty() {
+        format!(
+            r#"<tr><td colspan="6" class="empty">{}</td></tr>"#,
+            if page_data.budget_exhausted {
+                "No matches yet in the part searched so far."
             } else {
-                bytes
-            };
-            let text = String::from_utf8_lossy(&decoded);
-            format!("<pre>{}</pre>", escape(&text))
-        }
-        Err(err) => format!(
-            "<p class=\"error\">Failed to read body: {}</p>",
-            escape(&err.to_string())
-        ),
+                "No requests match these filters."
+            }
+        )
+    } else {
+        page_data
+            .records
+            .iter()
+            .map(|meta| request_row(&prefix, meta))
+            .collect()
+    };
+
+    let mut pager_links = Vec::new();
+    if cursor.is_some() {
+        pager_links.push(format!(
+            r#"<a class="button secondary small" href="{}">&larr; Newest</a>"#,
+            escape(&filters.url(&prefix, &[]))
+        ));
     }
+    if page_data.next.is_some() && !page_data.budget_exhausted {
+        pager_links.push(format!(
+            r#"<a class="button secondary small" href="{}">Older &rarr;</a>"#,
+            escape(&next_url(&filters, &prefix, &page_data))
+        ));
+    }
+    let pager = format!(
+        r#"<div class="pager"><span>{} shown, newest first{}</span><span style="display:flex;gap:8px">{}</span></div>"#,
+        page_data.records.len(),
+        if cursor.is_some() {
+            " · older page"
+        } else {
+            ""
+        },
+        pager_links.join("")
+    );
+
+    let body = format!(
+        r#"{filter_bar}{notice}
+<div class="card flush">
+<table class="results"><thead><tr><th>Time</th><th>Method</th><th>Path</th><th class="num">Body</th><th class="ctype">Content type</th><th>Status</th></tr></thead>
+<tbody>{rows}</tbody></table>
+{pager}
+</div>"#
+    );
+    let subtitle = if filters.path.is_empty() {
+        "Every captured request, newest first.".to_string()
+    } else {
+        format!("Paths starting with {}", filters.path)
+    };
+    page(&state, "Requests", Some(&subtitle), "requests", "", &body)
 }
 
-fn request_row(state: &AppState, record: &RequestRecord) -> String {
+fn next_url(filters: &Filters, prefix: &str, page: &SearchPage) -> String {
+    let before = page
+        .next
+        .as_deref()
+        .map(|key| URL_SAFE_NO_PAD.encode(key))
+        .unwrap_or_default();
+    filters.url(prefix, &[("before", &before)])
+}
+
+fn request_row(prefix: &str, meta: &RequestMeta) -> String {
+    let href = format!("{prefix}/requests/{}", urlencoding::encode(&meta.id));
     format!(
-        r#"<tr>
-<td class="mono"><a href="{}/requests/{}">{}</a></td>
-<td>{}</td>
-<td class="path">{}{}</td>
-<td class="num">{}</td>
-<td>{}</td>
+        r#"<tr data-href="{href}">
+<td class="time">{time}<small>{date}</small></td>
+<td>{method}</td>
+<td class="path"><a href="{href}">{path}</a>{query}</td>
+<td class="num">{size}</td>
+<td class="ctype">{ctype}</td>
+<td>{status}</td>
 </tr>"#,
-        state.config.server.admin_prefix,
-        urlencoding::encode(&record.meta.id),
-        escape(
-            &record
-                .meta
-                .received_at
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        ),
-        method_chip(&record.meta.method),
-        escape(&record.meta.path),
-        record
-            .meta
+        href = escape(&href),
+        time = meta.received_at.format("%H:%M:%S%.3f"),
+        date = meta.received_at.format("%Y-%m-%d"),
+        method = method_chip(&meta.method),
+        path = escape(&meta.path),
+        query = meta
             .query
             .as_ref()
-            .map(|q| format!("<span class=\"query\">?{}</span>", escape(q)))
+            .map(|q| format!(r#"<span class="query">?{}</span>"#, escape(q)))
             .unwrap_or_default(),
-        human_bytes(record.meta.body.original_size),
-        body_status(&record.meta)
+        size = human_bytes(meta.body.original_size),
+        ctype = escape(meta.body.content_type.as_deref().unwrap_or("")),
+        status = body_status(meta),
     )
 }
+
+// ---------- request detail ----------
+
+async fn request_detail(state: AppState, id: &str) -> Response {
+    let prefix = admin_prefix(&state);
+    let meta = match state.storage.get(id).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => {
+            let body = format!(
+                r#"<p class="crumbs"><a href="{prefix}/requests">&larr; Requests</a></p>
+<div class="card"><p>No request with id <span class="mono">{}</span>. It may have expired and been removed by retention.</p></div>"#,
+                escape(id)
+            );
+            let mut response = page(&state, "Request not found", None, "requests", "", &body);
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            return response;
+        }
+        Err(err) => return error_response(err),
+    };
+
+    let body_url = state
+        .storage
+        .blob_path(&meta)
+        .map(|_| format!("{prefix}/requests/{}/body", urlencoding::encode(&meta.id)));
+    let data = serde_json::json!({ "meta": &meta, "bodyUrl": body_url });
+    // JSON inside <script>: escape `<` so the data can never close the tag.
+    let data = data.to_string().replace('<', "\\u003c");
+
+    let header_count = meta
+        .headers
+        .values()
+        .map(|v| v.as_array().map_or(1, Vec::len))
+        .sum::<usize>();
+    let header_rows: String = {
+        let mut names: Vec<_> = meta.headers.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .flat_map(|name| {
+                let values = match &meta.headers[name] {
+                    serde_json::Value::Array(values) => values.clone(),
+                    other => vec![other.clone()],
+                };
+                values.into_iter().map(move |value| {
+                    format!(
+                        "<tr><td>{}</td><td>{}</td></tr>",
+                        escape(name),
+                        escape(value.as_str().unwrap_or(&value.to_string()))
+                    )
+                })
+            })
+            .collect()
+    };
+    let query_params = meta.query.as_deref().map(parse_form).unwrap_or_default();
+    let query_rows: String = if query_params.is_empty() {
+        r#"<tr><td colspan="2" class="empty">No query string.</td></tr>"#.to_string()
+    } else {
+        query_params
+            .iter()
+            .map(|(k, v)| format!("<tr><td>{}</td><td>{}</td></tr>", escape(k), escape(v)))
+            .collect()
+    };
+    let raw = serde_json::to_string_pretty(&meta).unwrap_or_default();
+
+    let size = if meta.body.stored {
+        format!(
+            "{} <span class=\"muted\">({} stored{})</span>",
+            human_bytes(meta.body.original_size),
+            human_bytes(meta.body.stored_size),
+            meta.body
+                .encoding
+                .as_deref()
+                .map(|e| format!(", {e}"))
+                .unwrap_or_default()
+        )
+    } else {
+        human_bytes(meta.body.original_size)
+    };
+    let error = meta
+        .body
+        .error
+        .as_deref()
+        .map(|e| {
+            format!(
+                r#"<div><span>Error</span><b class="error">{}</b></div>"#,
+                escape(e)
+            )
+        })
+        .unwrap_or_default();
+
+    let head = format!(
+        r#"<p class="crumbs"><a href="{prefix}/requests">&larr; Requests</a></p>
+<div class="page-head">
+  <div style="min-width:0">
+    <div class="req-title">{method}<h1>{path}</h1></div>
+    <p>{received} &middot; <span class="mono">{id}</span></p>
+  </div>
+  <div class="actions"><button id="copy-curl" type="button" class="secondary">Copy as cURL</button></div>
+</div>"#,
+        method = method_chip(&meta.method),
+        path = escape(&format!(
+            "{}{}",
+            meta.path,
+            meta.query
+                .as_deref()
+                .map(|q| format!("?{q}"))
+                .unwrap_or_default()
+        )),
+        received = escape(
+            &meta
+                .received_at
+                .format("%Y-%m-%d %H:%M:%S%.3f %:z")
+                .to_string()
+        ),
+        id = escape(&meta.id),
+    );
+    let body = format!(
+        r#"<section class="summary">
+  <div><span>Status</span><b>{status}</b></div>
+  <div><span>Body</span><b>{size}</b></div>
+  <div><span>Content type</span><b>{ctype}</b></div>
+  <div><span>Body mode</span><b>{mode}</b></div>
+  {error}
+</section>
+<div class="card">
+  <div class="tabs" role="tablist">
+    <button type="button" data-tab="body">Body</button>
+    <button type="button" data-tab="headers">Headers<small>{header_count}</small></button>
+    <button type="button" data-tab="query">Query<small>{query_count}</small></button>
+    <button type="button" data-tab="raw">Raw</button>
+  </div>
+  <div id="tab-body"><p class="muted">Loading&hellip;</p></div>
+  <div id="tab-headers" hidden><table class="kv"><tbody>{header_rows}</tbody></table></div>
+  <div id="tab-query" hidden><table class="kv"><tbody>{query_rows}</tbody></table></div>
+  <div id="tab-raw" hidden><pre>{raw}</pre></div>
+</div>
+<script type="application/json" id="req-data">{data}</script>"#,
+        status = body_status(&meta),
+        ctype = escape(meta.body.content_type.as_deref().unwrap_or("—")),
+        mode = escape(&meta.body.mode),
+        query_count = query_params.len(),
+        raw = escape(&raw),
+    );
+    page(&state, &meta.path, None, "requests", &head, &body)
+}
+
+// ---------- live stream ----------
+
+fn stream_view(state: &AppState) -> Response {
+    let prefix = admin_prefix(state);
+    // JSON string literal, with `<` escaped so it cannot close the script tag.
+    let prefix_js = serde_json::to_string(&prefix)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c");
+    let token_required = if state.config.stream.token.is_some() {
+        "true"
+    } else {
+        "false"
+    };
+    let body = STREAM_VIEW
+        .replace("__ADMIN_PREFIX__", &prefix_js)
+        .replace("__TOKEN_REQUIRED__", token_required);
+    page(
+        state,
+        "Live stream",
+        Some("Requests as they arrive. Expand a card to load its body."),
+        "stream",
+        "",
+        &body,
+    )
+}
+
+// ---------- shared rendering ----------
 
 fn method_chip(method: &str) -> String {
     let class = match method {
@@ -488,25 +795,54 @@ fn body_status(meta: &RequestMeta) -> String {
     }
 }
 
-fn stream_view(state: &AppState) -> Response {
-    let prefix = state.config.server.admin_prefix.trim_end_matches('/');
-    // JSON string literal, with `<` escaped so it cannot close the script tag.
-    let prefix_js = serde_json::to_string(prefix)
-        .unwrap_or_else(|_| "\"\"".to_string())
-        .replace('<', "\\u003c");
-    let token_required = if state.config.stream.token.is_some() {
-        "true"
+fn admin_prefix(state: &AppState) -> String {
+    state
+        .config
+        .server
+        .admin_prefix
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// `30 days`, `2 hours`, `45 min`: coarse, for display only.
+fn short_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let (value, unit) = if secs >= 86_400 && secs % 86_400 == 0 {
+        (secs / 86_400, "day")
+    } else if secs >= 3_600 && secs % 3_600 == 0 {
+        (secs / 3_600, "hour")
+    } else if secs >= 60 {
+        (secs / 60, "min")
     } else {
-        "false"
+        (secs, "sec")
     };
-    let body = STREAM_VIEW
-        .replace("__ADMIN_PREFIX__", &prefix_js)
-        .replace("__TOKEN_REQUIRED__", token_required);
-    page(state, "Live stream", "stream", &body)
+    let plural = if value == 1 || unit == "min" || unit == "sec" {
+        ""
+    } else {
+        "s"
+    };
+    format!("{value} {unit}{plural}")
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    chrono::DateTime::<Local>::from(time)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+fn asset(content_type: &'static str, body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 fn login_page(state: &AppState, error: Option<&str>, status: StatusCode) -> Response {
-    let prefix = state.config.server.admin_prefix.trim_end_matches('/');
+    let prefix = admin_prefix(state);
     let error_html = error
         .map(|message| format!("<p class=\"form-error\">{}</p>", escape(message)))
         .unwrap_or_default();
@@ -539,19 +875,52 @@ fn login_page(state: &AppState, error: Option<&str>, status: StatusCode) -> Resp
     (status, Html(html)).into_response()
 }
 
-fn page(state: &AppState, title: &str, active: &str, body: &str) -> Response {
-    let prefix = state.config.server.admin_prefix.trim_end_matches('/');
-    let nav_class = |name: &str| {
-        if name == active {
-            " class=\"active\""
-        } else {
-            ""
-        }
-    };
+const ICON_OVERVIEW: &str = r#"<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1.2"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1.2"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1.2"/><rect x="9" y="9" width="5.5" height="5.5" rx="1.2"/></svg>"#;
+const ICON_REQUESTS: &str = r#"<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 3.5h12M2 8h12M2 12.5h8"/></svg>"#;
+const ICON_STREAM: &str = r#"<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="8" cy="8" r="1.6"/><path d="M4.8 4.8a4.5 4.5 0 0 0 0 6.4M11.2 4.8a4.5 4.5 0 0 1 0 6.4M2.6 2.6a7.6 7.6 0 0 0 0 10.8M13.4 2.6a7.6 7.6 0 0 1 0 10.8"/></svg>"#;
+
+/// Shared layout. `head` replaces the default title block when non-empty.
+fn page(
+    state: &AppState,
+    title: &str,
+    subtitle: Option<&str>,
+    active: &str,
+    head: &str,
+    body: &str,
+) -> Response {
+    let prefix = admin_prefix(state);
+    let nav = [
+        ("overview", "/", "Overview", ICON_OVERVIEW),
+        ("requests", "/requests", "Requests", ICON_REQUESTS),
+        ("stream", "/streamview", "Live stream", ICON_STREAM),
+    ]
+    .iter()
+    .map(|(key, href, label, icon)| {
+        format!(
+            r#"<a href="{prefix}{href}"{}>{icon}<span>{label}</span></a>"#,
+            if *key == active {
+                r#" class="active""#
+            } else {
+                ""
+            }
+        )
+    })
+    .collect::<String>();
     let logout = if state.config.admin.password.is_some() {
         format!("<a class=\"logout\" href=\"{prefix}/logout\">Sign out</a>")
     } else {
         String::new()
+    };
+    let head = if head.is_empty() {
+        format!(
+            r#"<div class="page-head"><div><h1>{}</h1>{}</div></div>"#,
+            escape(title),
+            subtitle
+                .map(|s| format!("<p>{}</p>", escape(s)))
+                .unwrap_or_default()
+        )
+    } else {
+        head.to_string()
     };
     let html = format!(
         r#"<!doctype html>
@@ -559,332 +928,31 @@ fn page(state: &AppState, title: &str, active: &str, body: &str) -> Response {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{title_escaped} &middot; Webhook Debug</title>
+  <title>{title} &middot; Webhook Debug</title>
   <link rel="stylesheet" href="{prefix}/style.css">
+  <script src="{prefix}/app.js"></script>
 </head>
 <body>
   <aside>
     <div class="brand"><span class="brand-mark">&#9889;</span><span class="brand-name">Webhook Debug</span></div>
-    <nav>
-      <a href="{prefix}/"{dash_active}>Dashboard</a>
-      <a href="{prefix}/requests"{req_active}>Requests</a>
-      <a href="{prefix}/streamview"{stream_active}>Live stream</a>
-    </nav>
+    <nav>{nav}</nav>
     <div class="side-footer">
-      <small>{root}</small>
+      <small><b>Database</b>{db}</small>
+      <small><b>Blobs</b>{blobs}</small>
       {logout}
     </div>
   </aside>
   <main>
-    <header><h1>{title_escaped}</h1></header>
+    {head}
     {body}
   </main>
 </body>
 </html>"#,
-        title_escaped = escape(title),
-        prefix = prefix,
-        dash_active = nav_class("dashboard"),
-        req_active = nav_class("requests"),
-        stream_active = nav_class("stream"),
-        root = escape(&state.storage.root().display().to_string()),
-        logout = logout,
-        body = body
+        title = escape(title),
+        db = escape(&state.config.storage.db.display().to_string()),
+        blobs = escape(&state.config.storage.blobs.display().to_string()),
     );
     Html(html).into_response()
-}
-
-fn css() -> Response {
-    let css = r#"
-:root {
-  color-scheme: light;
-  --plane: #f9f9f7;
-  --surface: #fcfcfb;
-  --ink: #0b0b0b;
-  --ink-2: #52514e;
-  --muted: #898781;
-  --hairline: #e1e0d9;
-  --ring: rgba(11, 11, 11, 0.10);
-  --accent: #2a78d6;
-  --accent-strong: #256abf;
-  --accent-deep: #1c5cab;
-  --side-bg: #1a1a19;
-  --side-ink: #ffffff;
-  --side-ink-2: #c3c2b7;
-  --side-ring: rgba(255, 255, 255, 0.10);
-  --good-bg: #e3f6e3; --good-ink: #006300;
-  --warn-bg: #fdf0d1; --warn-ink: #7a5200;
-  --bad-bg: #fbe3e3;  --bad-ink: #a32222;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  color: var(--ink);
-  background: var(--plane);
-}
-* { box-sizing: border-box; }
-body { margin: 0; min-height: 100vh; display: grid; grid-template-columns: 248px 1fr; }
-
-aside {
-  background: var(--side-bg); color: var(--side-ink);
-  padding: 22px 18px; display: flex; flex-direction: column; gap: 26px;
-}
-.brand { display: flex; align-items: center; gap: 10px; }
-.brand-mark {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 32px; height: 32px; border-radius: 9px; font-size: 17px;
-  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
-}
-.brand-name { font-size: 16px; font-weight: 650; letter-spacing: 0.01em; }
-aside nav { display: grid; gap: 4px; }
-aside nav a {
-  color: var(--side-ink-2); text-decoration: none; font-size: 14px; font-weight: 500;
-  padding: 9px 12px; border-radius: 8px; transition: background 120ms, color 120ms;
-}
-aside nav a:hover { background: rgba(255, 255, 255, 0.07); color: var(--side-ink); }
-aside nav a.active {
-  background: rgba(57, 135, 229, 0.22); color: var(--side-ink); font-weight: 600;
-}
-.side-footer { margin-top: auto; display: grid; gap: 12px; }
-.side-footer small { color: var(--muted); overflow-wrap: anywhere; line-height: 1.4; }
-.logout {
-  color: var(--side-ink-2); text-decoration: none; font-size: 13px; font-weight: 600;
-  padding: 8px 12px; border: 1px solid var(--side-ring); border-radius: 8px; text-align: center;
-  transition: background 120ms, color 120ms;
-}
-.logout:hover { background: rgba(255, 255, 255, 0.07); color: var(--side-ink); }
-
-main { padding: 30px 36px; overflow-x: auto; }
-header { margin-bottom: 22px; }
-header h1 { margin: 0; font-size: 26px; font-weight: 650; letter-spacing: -0.01em; }
-h2 { margin: 0 0 12px; font-size: 15px; font-weight: 650; color: var(--ink-2); }
-
-.metrics { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 14px; margin-bottom: 22px; }
-.tile {
-  background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
-  padding: 16px 18px; box-shadow: 0 1px 2px rgba(11, 11, 11, 0.04);
-}
-.tile span { display: block; font-size: 13px; color: var(--ink-2); margin-bottom: 6px; }
-.tile b { font-size: 30px; font-weight: 600; line-height: 1.1; }
-
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
-.card {
-  background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
-  padding: 16px 18px; box-shadow: 0 1px 2px rgba(11, 11, 11, 0.04); overflow-x: auto;
-}
-.card table { border: 0; box-shadow: none; }
-
-table { width: 100%; border-collapse: collapse; background: var(--surface); }
-th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--hairline); vertical-align: top; }
-th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 650; }
-tr:last-child td { border-bottom: 0; }
-tbody tr { transition: background 100ms; }
-tbody tr:hover { background: rgba(42, 120, 214, 0.045); }
-td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-td.mono { font-variant-numeric: tabular-nums; white-space: nowrap; }
-td.path { overflow-wrap: anywhere; }
-td.empty { color: var(--muted); text-align: center; padding: 28px 12px; }
-
-a { color: var(--accent-strong); text-decoration: none; }
-a:hover { text-decoration: underline; }
-.backlink { margin: -8px 0 14px; font-size: 13px; }
-.query { color: var(--muted); overflow-wrap: anywhere; }
-.muted { color: var(--muted); }
-
-.method {
-  display: inline-block; min-width: 52px; text-align: center;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; font-weight: 700;
-  padding: 3px 8px; border-radius: 6px; background: #f0efec; color: var(--ink-2);
-}
-.method.get { background: #e7f0fb; color: var(--accent-deep); }
-.method.post { background: var(--good-bg); color: var(--good-ink); }
-.method.put { background: var(--warn-bg); color: var(--warn-ink); }
-.method.delete { background: var(--bad-bg); color: var(--bad-ink); }
-
-.pill {
-  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
-  padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 650;
-}
-.pill.ok { color: var(--good-ink); background: var(--good-bg); }
-.pill.warn { color: var(--warn-ink); background: var(--warn-bg); }
-.pill.bad { color: var(--bad-ink); background: var(--bad-bg); }
-
-.toolbar { margin-bottom: 16px; }
-form { display: flex; gap: 8px; }
-input {
-  min-width: 320px; padding: 9px 12px; font: inherit; color: var(--ink);
-  background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px;
-  transition: border-color 120ms, box-shadow 120ms;
-}
-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(42, 120, 214, 0.18); }
-button {
-  padding: 9px 16px; border: 0; border-radius: 8px; font: inherit; font-weight: 650;
-  background: var(--accent); color: #fff; cursor: pointer; transition: background 120ms;
-}
-button:hover { background: var(--accent-strong); }
-button:focus-visible { outline: 2px solid var(--accent-deep); outline-offset: 2px; }
-
-.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; align-items: start; }
-.summary div { border: 1px solid var(--hairline); border-radius: 10px; padding: 12px 14px; }
-.summary b { font-size: 14px; }
-.summary span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-.summary b { font-weight: 600; overflow-wrap: anywhere; }
-
-pre {
-  background: var(--side-bg); color: #e8e7e0; border-radius: 10px; padding: 14px 16px;
-  overflow: auto; line-height: 1.5; font-size: 13px;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-}
-.error { color: var(--bad-ink); }
-
-.login-body {
-  display: flex; align-items: center; justify-content: center;
-  min-height: 100vh; padding: 24px; grid-template-columns: none;
-}
-.login-card {
-  width: 100%; max-width: 380px; background: var(--surface);
-  border: 1px solid var(--ring); border-radius: 16px; padding: 32px;
-  box-shadow: 0 12px 32px rgba(11, 11, 11, 0.08);
-}
-.login-card .brand { color: var(--ink); margin-bottom: 22px; }
-.login-card .brand-mark { color: #fff; }
-.login-card h1 { margin: 0 0 6px; font-size: 22px; font-weight: 650; }
-.login-card p { margin: 0 0 18px; font-size: 14px; line-height: 1.5; }
-.login-card form { display: block; }
-.login-card label { display: block; font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 14px 0 6px; }
-.login-card input { display: block; width: 100%; min-width: 0; }
-.login-card button { width: 100%; margin-top: 20px; padding: 11px 16px; }
-.form-error {
-  background: var(--bad-bg); color: var(--bad-ink); border-radius: 8px;
-  padding: 10px 12px; font-size: 13px; font-weight: 600;
-}
-
-button.secondary {
-  background: #f0efec; color: var(--ink); border: 1px solid var(--hairline); font-weight: 600;
-}
-button.secondary:hover { background: #e7e6e1; }
-
-.sv-toolbar { display: grid; gap: 14px; margin-bottom: 16px; }
-.sv-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
-.sv-form label {
-  display: grid; gap: 6px; flex: 1 1 220px;
-  font-size: 12px; font-weight: 650; color: var(--ink-2);
-}
-.sv-form input { min-width: 0; width: 100%; }
-.sv-form-actions { display: flex; gap: 8px; }
-.sv-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-.sv-counts { margin-right: auto; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.sv-status {
-  display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 999px;
-  font-size: 13px; background: #f0efec; color: var(--ink-2);
-}
-.sv-status b { font-weight: 650; }
-.sv-status i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-.sv-status.live { background: var(--good-bg); color: var(--good-ink); }
-.sv-status.live i { background: #1f9d3a; animation: sv-pulse 1.6s infinite; }
-.sv-status.paused { background: var(--warn-bg); color: var(--warn-ink); }
-.sv-status.paused i { background: #c98a00; }
-.sv-status.connecting { background: #e7f0fb; color: var(--accent-deep); }
-.sv-status.connecting i { background: var(--accent); }
-.sv-status.error { background: var(--bad-bg); color: var(--bad-ink); }
-.sv-status.error i { background: #d03b3b; }
-@keyframes sv-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(31, 157, 58, 0.5); }
-  70% { box-shadow: 0 0 0 7px rgba(31, 157, 58, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(31, 157, 58, 0); }
-}
-.sv-banner {
-  position: sticky; top: 8px; z-index: 2;
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  margin-bottom: 12px; padding: 10px 14px; border-radius: 10px;
-  background: var(--warn-bg); color: var(--warn-ink); font-size: 14px; font-weight: 600;
-  box-shadow: 0 4px 14px rgba(11, 11, 11, 0.08);
-}
-.sv-banner[hidden], .sv-empty[hidden] { display: none; }
-.sv-empty {
-  padding: 40px 20px; text-align: center; color: var(--muted);
-  border: 1px dashed var(--hairline); border-radius: 12px;
-}
-.sv-list { display: grid; gap: 10px; }
-.sv-card {
-  background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
-  box-shadow: 0 1px 2px rgba(11, 11, 11, 0.04); overflow: hidden;
-  transition: box-shadow 120ms;
-}
-.sv-card.open { box-shadow: 0 6px 18px rgba(11, 11, 11, 0.08); }
-.sv-card.fresh { animation: sv-flash 1.4s ease-out; }
-@keyframes sv-flash {
-  from { background: #eaf2fd; border-color: rgba(42, 120, 214, 0.45); }
-  to { background: var(--surface); border-color: var(--ring); }
-}
-.sv-head {
-  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
-  align-items: center; gap: 12px; padding: 12px 16px; cursor: pointer; user-select: none;
-}
-.sv-head:hover { background: rgba(42, 120, 214, 0.045); }
-.sv-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.sv-path {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.sv-size, .sv-time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.sv-chev { color: var(--muted); transition: transform 150ms; }
-.sv-card.open .sv-chev { transform: rotate(90deg); }
-.sv-snippet {
-  margin-top: -6px; padding: 0 16px 12px;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: var(--ink-2);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.sv-snippet.muted { color: var(--muted); font-style: italic; }
-.sv-card.open .sv-snippet { display: none; }
-.sv-detail { display: grid; gap: 18px; padding: 16px; border-top: 1px solid var(--hairline); }
-.sv-detail[hidden] { display: none; }
-.sv-detail .summary { margin-bottom: 0; }
-.sv-section h3 {
-  display: flex; align-items: center; gap: 8px; margin: 0 0 8px;
-  font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
-}
-.sv-tools { display: flex; gap: 6px; margin-left: auto; text-transform: none; letter-spacing: 0; }
-.sv-tools button, .sv-more { padding: 4px 10px; font-size: 12px; }
-.sv-more { margin-top: 8px; }
-.sv-partial {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 8px;
-  font-size: 13px; color: var(--ink-2);
-}
-.sv-partial .sv-more { margin: 0; }
-.sv-partial[hidden] { display: none; }
-.sv-kind {
-  padding: 1px 7px; border-radius: 6px; background: #e7f0fb; color: var(--accent-deep);
-  letter-spacing: 0.02em;
-}
-.sv-section pre { margin: 0; max-height: 520px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.sv-note {
-  margin: 0 0 8px; padding: 8px 12px; border-radius: 8px;
-  background: var(--warn-bg); color: var(--warn-ink); font-size: 13px; font-weight: 600;
-}
-.sv-headers td { padding: 6px 10px; font-size: 13px; }
-.sv-hname { width: 30%; color: var(--ink-2); font-weight: 600; white-space: nowrap; }
-.sv-hval { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
-.sv-raw summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-2); }
-.sv-raw pre { margin: 8px 0 0; max-height: 420px; }
-
-@media (max-width: 900px) {
-  body { grid-template-columns: 1fr; }
-  aside { flex-direction: row; align-items: center; gap: 14px; padding: 14px 16px; }
-  aside nav { display: flex; gap: 4px; }
-  .side-footer { margin: 0 0 0 auto; }
-  .side-footer small { display: none; }
-  .metrics, .grid { grid-template-columns: 1fr 1fr; }
-  main { padding: 20px; }
-  input { min-width: 0; width: 100%; }
-}
-@media (max-width: 560px) {
-  .metrics, .grid { grid-template-columns: 1fr; }
-  .sv-head { grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 8px; }
-  .sv-head .sv-size, .sv-head .pill { display: none; }
-}
-"#;
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        css.to_string(),
-    )
-        .into_response()
 }
 
 fn error_response(err: anyhow::Error) -> Response {

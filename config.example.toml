@@ -10,14 +10,17 @@ password = "changeme"
 
 [storage]
 backend = "local"
-root = "./data"
+# Request database; keep it on a local disk, not NFS.
+db = "./data/db"
+# Body files, in a hashed fan-out of folders. May be on NFS.
+blobs = "./data/blobs"
 
 [retention]
 default_ttl = "30d"
 min_ttl = "2h"
 cleanup_interval = "1h"
-# Empty folders and orphaned files (stale *.json.tmp, body files whose
-# metadata was never written) are only removed once untouched this long.
+# Body files with no matching request (left by a crash mid-capture) are
+# only removed once untouched this long.
 prune_grace = "1h"
 
 [body]

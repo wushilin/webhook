@@ -1,7 +1,4 @@
-use std::{
-    path::{Component, Path, PathBuf},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -12,7 +9,6 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use named_queue::{QueueRegistry, Receiver, Sender};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
@@ -22,7 +18,6 @@ use tracing::{info, warn};
 use crate::{admin, config, models::RequestMeta, AppState};
 
 const QUEUE_NAME: &str = "requests";
-const BODY_FILE_SUFFIXES: [&str; 2] = [".body.bin", ".body.bin.gz"];
 
 /// One captured request, serialized once and shared by every consumer.
 #[derive(Clone)]
@@ -63,13 +58,13 @@ impl StreamHub {
         })
     }
 
-    /// Called once the request's body file and metadata have been written.
-    /// Events carry metadata only; `body_ref` (from [`body_ref`]) points at
-    /// the stored body for on-demand fetching.
-    pub fn publish(&self, meta: &RequestMeta, body_ref: Option<String>) {
+    /// Called once the request's body file and envelope have been written.
+    /// Events carry metadata only; `body_url` fetches the stored body.
+    pub fn publish(&self, meta: &RequestMeta) {
         let payload = StreamPayload {
             meta,
-            body_url: body_ref.map(|r| format!("{}/stream/body/{r}", self.admin_prefix)),
+            body_url: (meta.body.stored && meta.body.object.is_some())
+                .then(|| format!("{}/stream/body/{}", self.admin_prefix, meta.id)),
         };
         let json = match serde_json::to_string(&payload) {
             Ok(json) => json,
@@ -93,28 +88,6 @@ impl StreamHub {
     pub fn shutdown(&self) {
         let _ = self.registry.shutdown(QUEUE_NAME);
     }
-}
-
-/// URL-safe reference to a body file: its path relative to the storage root.
-pub fn body_ref(root: &Path, body_path: &Path) -> Option<String> {
-    let relative = body_path.strip_prefix(root).ok()?;
-    Some(URL_SAFE_NO_PAD.encode(relative.to_str()?))
-}
-
-/// Inverse of [`body_ref`]. Accepts only plain relative paths that name a
-/// body file, so a reference can never reach outside the storage root.
-fn decode_body_ref(encoded: &str) -> Option<PathBuf> {
-    let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
-    let relative = PathBuf::from(String::from_utf8(bytes).ok()?);
-    let plain = relative.components().count() > 0
-        && relative
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)));
-    let file_name = relative.file_name()?.to_str()?;
-    let body_file = BODY_FILE_SUFFIXES
-        .iter()
-        .any(|suffix| file_name.len() > suffix.len() && file_name.ends_with(suffix));
-    (plain && body_file).then_some(relative)
 }
 
 /// Token check shared by the websocket and the body endpoint; with no
@@ -146,26 +119,41 @@ pub async fn handle(state: AppState, req: Request<Body>) -> Response {
     ws.on_upgrade(move |socket| consume(socket, rx, prefix))
 }
 
-/// Streams a stored body from disk, gunzipped, optionally cut to `?limit=N`
-/// bytes. Served as an inert download so a captured HTML or script body can
-/// never run on the admin origin.
-pub async fn body(state: AppState, req: Request<Body>, encoded: &str) -> Response {
+/// `GET <admin_prefix>/stream/body/<id>`, authorised by the stream token.
+pub async fn body(state: AppState, req: Request<Body>, id: &str) -> Response {
     let query = req.uri().query().map(admin::parse_form).unwrap_or_default();
     if !authorize(&state, req.headers(), &query) {
         return (StatusCode::UNAUTHORIZED, "invalid stream token\n").into_response();
     }
-    let Some(relative) = decode_body_ref(encoded) else {
-        return (StatusCode::NOT_FOUND, "unknown body reference\n").into_response();
-    };
-    let limit = match admin::form_value(&query, "limit") {
+    serve_body(&state, id, &query).await
+}
+
+/// Streams a stored body from disk, gunzipped, optionally cut to `?limit=N`
+/// bytes. Served as an inert download so a captured HTML or script body can
+/// never run on the admin origin. Shared with the admin pages.
+pub async fn serve_body(state: &AppState, id: &str, query: &[(String, String)]) -> Response {
+    let limit = match admin::form_value(query, "limit") {
         None => u64::MAX,
         Some(raw) => match raw.parse::<u64>() {
             Ok(limit) => limit,
             Err(_) => return (StatusCode::BAD_REQUEST, "invalid limit\n").into_response(),
         },
     };
-
-    let path = state.storage.root().join(&relative);
+    let meta = match state.storage.get(id).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return (StatusCode::NOT_FOUND, "unknown request\n").into_response(),
+        Err(err) => {
+            warn!(error = ?err, "failed to load request");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load request\n",
+            )
+                .into_response();
+        }
+    };
+    let Some(path) = state.storage.blob_path(&meta) else {
+        return (StatusCode::NOT_FOUND, "request has no stored body\n").into_response();
+    };
     let file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -176,7 +164,8 @@ pub async fn body(state: AppState, req: Request<Body>, encoded: &str) -> Respons
             return (StatusCode::INTERNAL_SERVER_ERROR, "failed to open body\n").into_response();
         }
     };
-    let reader: Box<dyn AsyncRead + Send + Unpin> = if path.extension() == Some("gz".as_ref()) {
+    let reader: Box<dyn AsyncRead + Send + Unpin> = if meta.body.encoding.as_deref() == Some("gzip")
+    {
         Box::new(async_compression::tokio::bufread::GzipDecoder::new(
             BufReader::new(file),
         ))
@@ -253,23 +242,5 @@ mod tests {
         assert_eq!(normalize_prefix("/asdf").as_deref(), Some("/asdf"));
         assert_eq!(normalize_prefix(" asdf ").as_deref(), Some("/asdf"));
         assert_eq!(normalize_prefix("  "), None);
-    }
-
-    #[test]
-    fn body_ref_round_trips_and_rejects_escapes() {
-        let root = Path::new("./data");
-        let body = root.join("api/2026/10/12/22/00/45/45_1_host_x.body.bin.gz");
-        let encoded = body_ref(root, &body).unwrap();
-        assert_eq!(
-            decode_body_ref(&encoded).unwrap(),
-            PathBuf::from("api/2026/10/12/22/00/45/45_1_host_x.body.bin.gz")
-        );
-
-        let encode = |p: &str| URL_SAFE_NO_PAD.encode(p);
-        assert!(decode_body_ref(&encode("../etc/x.body.bin")).is_none());
-        assert!(decode_body_ref(&encode("/etc/x.body.bin")).is_none());
-        assert!(decode_body_ref(&encode("a/b/meta.json")).is_none());
-        assert!(decode_body_ref(&encode(".body.bin")).is_none());
-        assert!(decode_body_ref("not base64!").is_none());
     }
 }

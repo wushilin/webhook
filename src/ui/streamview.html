@@ -1,0 +1,323 @@
+<section class="card sv-toolbar">
+  <form id="sv-form" class="sv-form" autocomplete="off">
+    <label>Stream token
+      <input id="sv-token" type="password" spellcheck="false" placeholder="stream.token">
+    </label>
+    <label>Path prefix
+      <input id="sv-prefix" spellcheck="false" placeholder="All paths, or e.g. /api/v1">
+    </label>
+    <div class="sv-form-actions">
+      <button id="sv-connect" type="submit">Connect</button>
+      <button id="sv-disconnect" type="button" class="secondary" hidden>Disconnect</button>
+    </div>
+  </form>
+  <div class="sv-controls">
+    <span id="sv-status" class="sv-status off"><i></i><b>Disconnected</b></span>
+    <span id="sv-counts" class="sv-counts">0 received &middot; 0 shown</span>
+    <button id="sv-pause" type="button" class="secondary">Pause</button>
+    <button id="sv-collapse" type="button" class="secondary">Collapse all</button>
+    <button id="sv-clear" type="button" class="secondary">Clear</button>
+  </div>
+</section>
+<div id="sv-banner" class="sv-banner" hidden>
+  <span id="sv-banner-text"></span>
+  <button id="sv-resume" type="button">Resume</button>
+</div>
+<div id="sv-empty" class="sv-empty">
+  Connect to follow captured requests as they arrive. Newest appear on top; the latest 500 are kept.
+</div>
+<div id="sv-list" class="sv-list"></div>
+<script>
+(() => {
+  "use strict";
+  const ADMIN_PREFIX = __ADMIN_PREFIX__;
+  const TOKEN_REQUIRED = __TOKEN_REQUIRED__;
+  const MAX_CARDS = 500;
+  const { el, humanBytes, fmtTime, methodChip, statusPill, bodyViewer, headersTable } = window.WH;
+
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    form: $("sv-form"), token: $("sv-token"), prefix: $("sv-prefix"),
+    connect: $("sv-connect"), disconnect: $("sv-disconnect"),
+    status: $("sv-status"), counts: $("sv-counts"),
+    pause: $("sv-pause"), collapse: $("sv-collapse"), clear: $("sv-clear"),
+    banner: $("sv-banner"), bannerText: $("sv-banner-text"), resume: $("sv-resume"),
+    empty: $("sv-empty"), list: $("sv-list"),
+  };
+
+  const storage = {
+    get(key) { try { return localStorage.getItem(key); } catch (_) { return null; } },
+    set(key, value) { try { localStorage.setItem(key, value); } catch (_) {} },
+  };
+
+  let ws = null, wanted = false, opened = false, retry = 0, retryTimer = null;
+  let activePrefix = "", activeToken = "", prefixTimer = null;
+  let paused = false, pending = [], dropped = 0, received = 0;
+
+  // ?token=&prefix= prefill the form; the token is then stripped from the address bar.
+  const params = new URLSearchParams(location.search);
+  els.token.value = params.get("token") ?? storage.get("wh.stream.token") ?? "";
+  els.prefix.value = params.get("prefix") ?? storage.get("wh.stream.prefix") ?? "";
+  if (params.has("token")) {
+    params.delete("token");
+    const rest = params.toString();
+    history.replaceState(null, "", location.pathname + (rest ? "?" + rest : ""));
+  }
+  if (!TOKEN_REQUIRED) els.token.placeholder = "Not required (stream.token is unset)";
+
+  // ---------- connection ----------
+
+  function currentPrefix() {
+    const prefix = els.prefix.value.trim();
+    return prefix && !prefix.startsWith("/") ? "/" + prefix : prefix;
+  }
+
+  function streamUrl() {
+    const q = new URLSearchParams();
+    const token = els.token.value.trim();
+    const prefix = currentPrefix();
+    if (token) q.set("token", token);
+    if (prefix) q.set("prefix", prefix);
+    const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    const qs = q.toString();
+    return scheme + location.host + ADMIN_PREFIX + "/stream" + (qs ? "?" + qs : "");
+  }
+
+  function openSocket() {
+    clearTimeout(retryTimer);
+    const sock = new WebSocket(streamUrl());
+    ws = sock;
+    activePrefix = currentPrefix();
+    activeToken = els.token.value.trim();
+    opened = false;
+    setStatus("connecting", "Connecting…");
+    sock.onopen = () => {
+      if (sock !== ws) return;
+      opened = true;
+      retry = 0;
+      showConnectedStatus();
+    };
+    sock.onmessage = (e) => {
+      if (sock !== ws) return;
+      let ev;
+      try { ev = JSON.parse(e.data); } catch (_) { return; }
+      received++;
+      if (paused) {
+        pending.push(ev);
+        if (pending.length > MAX_CARDS) { pending.shift(); dropped++; }
+        updateBanner();
+      } else {
+        prependCards([ev]);
+      }
+      updateCounts();
+    };
+    sock.onclose = () => {
+      if (sock !== ws) return;
+      ws = null;
+      if (!wanted) { setStatus("off", "Disconnected"); return; }
+      const delay = Math.min(30000, 1000 * 2 ** retry);
+      retry++;
+      const secs = Math.round(delay / 1000);
+      setStatus("error", opened
+        ? `Connection lost · retrying in ${secs}s`
+        : `Cannot connect (check token) · retrying in ${secs}s`);
+      retryTimer = setTimeout(openSocket, delay);
+    };
+  }
+
+  function closeSocket() {
+    clearTimeout(retryTimer);
+    if (ws) { const old = ws; ws = null; old.close(); }
+  }
+
+  function connect() {
+    clearTimeout(prefixTimer);
+    storage.set("wh.stream.token", els.token.value.trim());
+    storage.set("wh.stream.prefix", currentPrefix());
+    wanted = true;
+    retry = 0;
+    closeSocket();
+    openSocket();
+    syncButtons();
+  }
+
+  function disconnect() {
+    wanted = false;
+    closeSocket();
+    setStatus("off", "Disconnected");
+    syncButtons();
+  }
+
+  function syncButtons() {
+    els.connect.textContent = wanted ? "Reconnect" : "Connect";
+    els.disconnect.hidden = !wanted;
+  }
+
+  function setStatus(kind, text) {
+    els.status.className = "sv-status " + kind;
+    els.status.querySelector("b").textContent = text;
+  }
+
+  function showConnectedStatus() {
+    if (!ws || !opened) return;
+    const scope = activePrefix ? ` · ${activePrefix}` : " · all paths";
+    if (paused) setStatus("paused", "Paused · stream still running" + scope);
+    else setStatus("live", "Live" + scope);
+  }
+
+  // ---------- pause / list ----------
+
+  function setPaused(value) {
+    paused = value;
+    els.pause.textContent = paused ? "Resume" : "Pause";
+    if (!paused) {
+      const batch = pending;
+      pending = [];
+      dropped = 0;
+      prependCards(batch);
+      updateCounts();
+    }
+    updateBanner();
+    showConnectedStatus();
+  }
+
+  function updateBanner() {
+    els.banner.hidden = !paused;
+    if (!paused) return;
+    const waiting = pending.length + dropped;
+    els.bannerText.textContent = waiting === 0
+      ? "Paused — the stream keeps running; new requests wait here."
+      : `Paused — ${waiting.toLocaleString()} new request${waiting === 1 ? "" : "s"} waiting`
+        + (dropped ? ` (latest ${MAX_CARDS} kept)` : "");
+  }
+
+  function updateCounts() {
+    const shown = els.list.childElementCount;
+    els.counts.textContent = `${received.toLocaleString()} received · ${shown.toLocaleString()} shown`;
+    els.empty.hidden = shown > 0;
+  }
+
+  /** Events arrive oldest first; the newest ends up on top. */
+  function prependCards(events) {
+    if (events.length === 0) return;
+    const fresh = events.length <= 20;
+    const frag = document.createDocumentFragment();
+    for (let i = events.length - 1; i >= 0 && frag.childNodes.length < MAX_CARDS; i--) {
+      frag.append(buildCard(events[i], fresh));
+    }
+    els.list.prepend(frag);
+    while (els.list.childElementCount > MAX_CARDS) els.list.lastElementChild.remove();
+  }
+
+  // ---------- cards (built from the envelope; bodies load on expand) ----------
+
+  function buildCard(ev, fresh) {
+    const body = ev.body || {};
+    const card = el("article", "sv-card" + (fresh ? " fresh" : ""));
+    const head = el("div", "sv-head");
+    head.tabIndex = 0;
+    head.setAttribute("role", "button");
+    head.setAttribute("aria-expanded", "false");
+
+    const path = el("span", "sv-path", ev.path || "/");
+    if (ev.query) path.append(el("span", "query", "?" + ev.query));
+    path.title = (ev.path || "/") + (ev.query ? "?" + ev.query : "");
+    const time = el("time", "sv-time", fmtTime(ev.received_at));
+    time.title = ev.received_at || "";
+
+    head.append(
+      methodChip(ev.method), path,
+      el("span", "sv-size", humanBytes(body.original_size || 0)),
+      statusPill(body), time, el("span", "sv-chev", "▸"),
+    );
+    card.append(head);
+
+    const size = body.original_size || 0;
+    if (size > 0) {
+      card.append(el("div", "sv-snippet", ev.body_url
+        ? body.content_type || "No content type"
+        : "Body not stored (metadata only)"));
+    }
+
+    let detail = null;
+    const toggle = () => {
+      const open = !card.classList.contains("open");
+      if (open && !detail) {
+        detail = buildDetail(ev);
+        card.append(detail);
+      }
+      card.classList.toggle("open", open);
+      if (detail) detail.hidden = !open;
+      head.setAttribute("aria-expanded", String(open));
+    };
+    head.addEventListener("click", toggle);
+    head.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+    });
+    return card;
+  }
+
+  function buildDetail(ev) {
+    const body = ev.body || {};
+    const detail = el("div", "sv-detail");
+
+    const summary = el("div", "summary");
+    const add = (label, value) => {
+      const box = el("div");
+      box.append(el("span", null, label), typeof value === "string" ? el("b", null, value) : value);
+      summary.append(box);
+    };
+    const open = el("a", null, "Open request →");
+    open.href = `${ADMIN_PREFIX}/requests/${encodeURIComponent(ev.id)}`;
+    add("Request", open);
+    add("Received", ev.received_at || "—");
+    let size = humanBytes(body.original_size || 0);
+    if (body.stored) size += ` (${humanBytes(body.stored_size || 0)} stored)`;
+    add("Size", size);
+    if (body.error) add("Error", body.error);
+    detail.append(summary);
+
+    const section = (title, content) => {
+      const s = el("section");
+      s.append(el("h3", null, title), content);
+      return s;
+    };
+    const viewer = el("div");
+    const headers = activeToken ? { Authorization: "Bearer " + activeToken } : {};
+    bodyViewer(viewer, ev, ev.body_url, headers);
+    detail.append(section("Body", viewer), section("Headers", headersTable(ev.headers)));
+    return detail;
+  }
+
+  // ---------- wiring ----------
+
+  els.form.addEventListener("submit", (e) => { e.preventDefault(); connect(); });
+  // A changed prefix applies by itself shortly after typing stops.
+  els.prefix.addEventListener("input", () => {
+    clearTimeout(prefixTimer);
+    if (!wanted) return;
+    prefixTimer = setTimeout(() => {
+      if (wanted && currentPrefix() !== activePrefix) connect();
+    }, 700);
+  });
+  els.disconnect.addEventListener("click", disconnect);
+  els.pause.addEventListener("click", () => setPaused(!paused));
+  els.resume.addEventListener("click", () => setPaused(false));
+  els.collapse.addEventListener("click", () => {
+    for (const card of els.list.querySelectorAll(".sv-card.open")) {
+      card.querySelector(".sv-head").click();
+    }
+  });
+  els.clear.addEventListener("click", () => {
+    els.list.replaceChildren();
+    pending = [];
+    dropped = 0;
+    updateBanner();
+    updateCounts();
+  });
+
+  updateCounts();
+  if (els.token.value || !TOKEN_REQUIRED) connect();
+  else els.token.focus();
+})();
+</script>

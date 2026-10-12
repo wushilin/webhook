@@ -59,8 +59,16 @@ pub struct ServerConfig {
 pub struct StorageConfig {
     #[serde(default = "default_storage_backend")]
     pub backend: String,
-    #[serde(default = "default_storage_root")]
-    pub root: PathBuf,
+    /// Request metadata database (fjall). Keep it on a local disk: embedded
+    /// databases rely on file locking and fsync semantics NFS does not give.
+    #[serde(default = "default_storage_db")]
+    pub db: PathBuf,
+    /// Body blobs, in a fixed hashed fan-out. May be on NFS.
+    #[serde(default = "default_storage_blobs")]
+    pub blobs: PathBuf,
+    /// Removed setting; present only so old configs fail with a clear message.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +215,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.storage.root.is_some() {
+            bail!(
+                "storage.root was replaced by storage.db (request database, keep it on a local disk) \
+                 and storage.blobs (body files); update the [storage] section"
+            );
+        }
         if self.storage.backend != "local" {
             bail!(
                 "storage.backend={} is not implemented yet; use backend=\"local\"",
@@ -323,14 +337,17 @@ username = "admin"
 
 [storage]
 backend = "local"
-root = "./data"
+# Request database; keep it on a local disk, not NFS.
+db = "./data/db"
+# Body files, in a hashed fan-out of folders. May be on NFS.
+blobs = "./data/blobs"
 
 [retention]
 default_ttl = "30d"
 min_ttl = "2h"
 cleanup_interval = "1h"
-# Empty folders and orphaned files (stale *.json.tmp, body files whose
-# metadata was never written) are only removed once untouched this long.
+# Body files with no matching request (left by a crash mid-capture) are
+# only removed once untouched this long.
 prune_grace = "1h"
 
 [body]
@@ -383,7 +400,9 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             backend: default_storage_backend(),
-            root: default_storage_root(),
+            db: default_storage_db(),
+            blobs: default_storage_blobs(),
+            root: None,
         }
     }
 }
@@ -440,8 +459,12 @@ fn default_storage_backend() -> String {
     "local".to_string()
 }
 
-fn default_storage_root() -> PathBuf {
-    PathBuf::from("./data")
+fn default_storage_db() -> PathBuf {
+    PathBuf::from("./data/db")
+}
+
+fn default_storage_blobs() -> PathBuf {
+    PathBuf::from("./data/blobs")
 }
 
 fn default_ttl() -> Duration {
@@ -597,7 +620,8 @@ admin_prefix = "/_custom_admin///"
         assert_eq!(parsed.admin.username, default.admin.username);
         assert_eq!(parsed.admin.password, default.admin.password);
         assert_eq!(parsed.storage.backend, default.storage.backend);
-        assert_eq!(parsed.storage.root, default.storage.root);
+        assert_eq!(parsed.storage.db, default.storage.db);
+        assert_eq!(parsed.storage.blobs, default.storage.blobs);
         assert_eq!(parsed.retention.default_ttl, default.retention.default_ttl);
         assert_eq!(parsed.retention.min_ttl, default.retention.min_ttl);
         assert_eq!(

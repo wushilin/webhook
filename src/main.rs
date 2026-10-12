@@ -20,7 +20,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use futures_util::StreamExt;
 use models::{BodyMeta, CaptureResponse, RequestMeta};
 use rand::{distributions::Alphanumeric, Rng};
-use storage::{LocalStorage, StoredRequestPaths};
+use storage::{BlobLocation, Storage};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -54,7 +54,7 @@ struct RunArgs {
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<config::Config>,
-    storage: Arc<LocalStorage>,
+    storage: Arc<Storage>,
     hostname: Arc<String>,
     sessions: Arc<admin::Sessions>,
     stream: Arc<stream::StreamHub>,
@@ -92,8 +92,7 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-host".to_string());
 
-    let storage = Arc::new(LocalStorage::new(config.storage.root.clone()));
-    storage.ensure_root().await?;
+    let storage = Arc::new(Storage::open(&config.storage.db, &config.storage.blobs)?);
 
     if config.stream.token.is_none() {
         warn!("stream.token is not configured; anyone can open the request stream");
@@ -175,7 +174,7 @@ async fn retention_worker(state: AppState) {
     let mut interval = tokio::time::interval(interval_period);
     loop {
         interval.tick().await;
-        if let Err(err) = state.storage.cleanup_expired(&state.config).await {
+        if let Err(err) = state.storage.cleanup(&state.config).await {
             warn!(error = ?err, "retention cleanup failed");
         }
     }
@@ -214,9 +213,6 @@ async fn capture_request_inner(state: AppState, req: Request<Body>) -> anyhow::R
     if let Some(len) = content_length {
         if len > rule.max_body_size {
             let id = request_id(received_at, &state.hostname);
-            let paths = state
-                .storage
-                .paths_for(&path, received_at, &id, rule.body_mode);
             let meta = build_meta(
                 &id,
                 received_at,
@@ -242,9 +238,9 @@ async fn capture_request_inner(state: AppState, req: Request<Body>) -> anyhow::R
             );
             state
                 .storage
-                .write_meta_with_expiry(&paths, &meta, expires_at(received_at, rule.ttl))
+                .put(&meta, expires_at(received_at, rule.ttl))
                 .await?;
-            state.stream.publish(&meta, None);
+            state.stream.publish(&meta);
             let capture_response = CaptureResponse {
                 success: false,
                 id,
@@ -266,10 +262,15 @@ async fn capture_request_inner(state: AppState, req: Request<Body>) -> anyhow::R
     }
 
     let id = request_id(received_at, &state.hostname);
-    let paths = state
-        .storage
-        .paths_for(&path, received_at, &id, rule.body_mode);
-    let body_meta = stream_body(&state.storage, req.into_body(), &paths, &headers, &rule).await;
+    let location = state.storage.blob_location(&id, rule.body_mode);
+    let body_meta = stream_body(
+        &state.storage,
+        req.into_body(),
+        location.as_ref(),
+        &headers,
+        &rule,
+    )
+    .await;
 
     let status = if body_meta.limit_exceeded {
         StatusCode::PAYLOAD_TOO_LARGE
@@ -295,13 +296,9 @@ async fn capture_request_inner(state: AppState, req: Request<Body>) -> anyhow::R
     let meta = build_meta(&id, received_at, method.as_str(), &uri, &headers, body_meta);
     state
         .storage
-        .write_meta_with_expiry(&paths, &meta, expires_at(received_at, rule.ttl))
+        .put(&meta, expires_at(received_at, rule.ttl))
         .await?;
-    let body_ref = paths
-        .body_path()
-        .filter(|_| meta.body.stored)
-        .and_then(|body_path| stream::body_ref(state.storage.root(), body_path));
-    state.stream.publish(&meta, body_ref);
+    state.stream.publish(&meta);
 
     if capture_response.success {
         let responder = state.config.responder_for_path(&path);
@@ -361,13 +358,13 @@ fn metadata_json_response(status: StatusCode, capture_response: &CaptureResponse
 }
 
 async fn stream_body(
-    storage: &LocalStorage,
+    storage: &Storage,
     body: Body,
-    paths: &StoredRequestPaths,
+    location: Option<&BlobLocation>,
     headers: &HeaderMap,
     rule: &config::ResolvedPathRule,
 ) -> BodyMeta {
-    if matches!(rule.body_mode, config::BodyMode::MetadataOnly) {
+    let Some(location) = location else {
         let mut stream = body.into_data_stream();
         let mut original_size = 0u64;
         let mut complete = true;
@@ -409,16 +406,16 @@ async fn stream_body(
             limit_exceeded,
             error,
         };
-    }
+    };
 
-    let file = match storage.create_body_file(paths).await {
+    let file = match storage.create_body_file(location).await {
         Ok(file) => file,
         Err(err) => {
             return BodyMeta {
                 stored: false,
                 complete: false,
                 mode: rule.body_mode.to_string(),
-                object: paths.body_file_name(),
+                object: Some(location.object.clone()),
                 encoding: rule.body_mode.encoding().map(ToString::to_string),
                 original_size: 0,
                 stored_size: 0,
@@ -476,12 +473,15 @@ async fn stream_body(
         error.get_or_insert_with(|| format!("body close failed: {err}"));
     }
 
-    let stored_size = paths.body_size().await.unwrap_or(0);
+    let stored_size = tokio::fs::metadata(&location.path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     BodyMeta {
         stored: true,
         complete,
         mode: rule.body_mode.to_string(),
-        object: paths.body_file_name(),
+        object: Some(location.object.clone()),
         encoding: rule.body_mode.encoding().map(ToString::to_string),
         original_size,
         stored_size,
@@ -567,16 +567,19 @@ fn headers_to_json(headers: &HeaderMap) -> serde_json::Map<String, serde_json::V
     map
 }
 
+/// `20261012T142016.557051647Z_<host>_<random>`: sorts by capture time (UTC),
+/// and is safe in URLs and file names.
 fn request_id(received_at: chrono::DateTime<Local>, hostname: &str) -> String {
     let random: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
-        .take(16)
+        .take(12)
         .map(char::from)
         .collect();
     format!(
-        "{:02}_{:09}_{}_{}",
-        received_at.second(),
-        received_at.timestamp_subsec_nanos(),
+        "{}_{}_{}",
+        received_at
+            .with_timezone(&chrono::Utc)
+            .format("%Y%m%dT%H%M%S%.9fZ"),
         hostname,
         random
     )
@@ -626,16 +629,6 @@ fn sanitize_token(input: &str) -> String {
         .collect()
 }
 
-trait SecondExt {
-    fn second(&self) -> u32;
-}
-
-impl SecondExt for chrono::DateTime<Local> {
-    fn second(&self) -> u32 {
-        chrono::Timelike::second(self)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,15 +664,16 @@ mod tests {
     ) -> TestServer {
         let tmp = TempDir::new().expect("tempdir");
         let mut config = config::Config::default();
-        config.storage.root = tmp.path().join("data");
+        config.storage.db = tmp.path().join("db");
+        config.storage.blobs = tmp.path().join("blobs");
         config.body.max_body_size = max_body_size;
         config.body.preview_limit = max_body_size;
         configure(&mut config);
 
         let config = Arc::new(config);
         let stream = Arc::new(stream::StreamHub::new(&config).expect("stream"));
-        let storage = Arc::new(LocalStorage::new(config.storage.root.clone()));
-        storage.ensure_root().await.expect("storage root");
+        let storage =
+            Arc::new(Storage::open(&config.storage.db, &config.storage.blobs).expect("storage"));
         let state = AppState {
             config,
             storage,
@@ -733,15 +727,33 @@ mod tests {
         })
     }
 
-    async fn wait_for_records(server: &TestServer, expected: usize) -> Vec<storage::RequestRecord> {
+    async fn recent(server: &TestServer) -> Vec<RequestMeta> {
+        let query = storage::SearchQuery {
+            prefix: None,
+            from: None,
+            to: None,
+            before: None,
+            limit: 20,
+            scan_budget: 10_000,
+        };
+        server
+            .state
+            .storage
+            .search(query)
+            .await
+            .expect("search")
+            .records
+    }
+
+    async fn wait_for_records(server: &TestServer, expected: usize) -> Vec<RequestMeta> {
         for _ in 0..40 {
-            let records = server.state.storage.recent(20, None).await.expect("recent");
+            let records = recent(server).await;
             if records.len() >= expected {
                 return records;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        server.state.storage.recent(20, None).await.expect("recent")
+        recent(server).await
     }
 
     #[tokio::test]
@@ -763,17 +775,15 @@ mod tests {
         assert_eq!(json["metadata_saved"], true);
 
         let records = wait_for_records(&server, 1).await;
-        let record = &records[0];
-        assert_eq!(
-            record.meta.query.as_deref(),
-            Some("alpha=1&encoded=%7Bz%7D")
-        );
-        assert!(record.meta.body.complete);
-        assert_eq!(record.meta.body.original_size, body.len() as u64);
+        let meta = &records[0];
+        assert_eq!(meta.query.as_deref(), Some("alpha=1&encoded=%7Bz%7D"));
+        assert!(meta.body.complete);
+        assert_eq!(meta.body.original_size, body.len() as u64);
 
-        let compressed = tokio::fs::read(record.body_path.as_ref().expect("body path"))
-            .await
-            .expect("read body");
+        // Blobs live in the hashed fan-out, named after the request id.
+        let blob = server.state.storage.blob_path(meta).expect("blob path");
+        assert!(blob.ends_with(format!("{}.body.bin.gz", meta.id)));
+        let compressed = tokio::fs::read(&blob).await.expect("read body");
         let mut decoder = GzDecoder::new(compressed.as_slice());
         let mut decoded = Vec::new();
         decoder.read_to_end(&mut decoded).expect("decompress");
@@ -796,7 +806,7 @@ mod tests {
         assert_eq!(json["body_stored"], false);
 
         let records = wait_for_records(&server, 1).await;
-        let meta = &records[0].meta;
+        let meta = &records[0];
         assert_eq!(meta.path, "/too-large");
         assert!(meta.body.limit_exceeded);
         assert!(!meta.body.stored);
@@ -804,7 +814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn funny_url_path_is_encoded_for_storage_and_query_is_preserved() {
+    async fn funny_url_path_and_query_are_preserved() {
         let server = spawn_test_server(1024).await;
         let request = b"GET /funny/a%20b/%E2%98%83/..%2Fescape?x=1&y=%7Bz%7D HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
@@ -812,15 +822,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
 
         let records = wait_for_records(&server, 1).await;
-        let record = &records[0];
-        assert_eq!(record.meta.path, "/funny/a%20b/%E2%98%83/..%2Fescape");
-        assert_eq!(record.meta.query.as_deref(), Some("x=1&y=%7Bz%7D"));
-
-        let meta_path = record.meta_path.to_string_lossy();
-        assert!(
-            meta_path.contains("/funny/a b/☃/..%2Fescape/"),
-            "{meta_path}"
-        );
+        assert_eq!(records[0].path, "/funny/a%20b/%E2%98%83/..%2Fescape");
+        assert_eq!(records[0].query.as_deref(), Some("x=1&y=%7Bz%7D"));
     }
 
     #[tokio::test]
@@ -837,7 +840,7 @@ mod tests {
 
         let records = wait_for_records(&server, 1).await;
         assert_eq!(records.len(), 1);
-        let meta = &records[0].meta;
+        let meta = &records[0];
         assert_eq!(meta.path, "/broken");
         assert!(!meta.body.complete);
         assert_eq!(meta.body.original_size, 5);
@@ -944,7 +947,57 @@ mod tests {
         )
         .await;
         assert!(authed.starts_with("HTTP/1.1 200"), "{authed}");
-        assert!(authed.contains("Dashboard"), "{authed}");
+        assert!(authed.contains("Overview"), "{authed}");
+
+        // Search, detail and the session-protected body endpoint.
+        raw_http(
+            server.addr,
+            b"POST /hooks/github?x=1 HTTP/1.1\r\nhost: localhost\r\ncontent-length: 9\r\nconnection: close\r\n\r\nbody-text",
+        )
+        .await;
+        let id = wait_for_records(&server, 1).await[0].id.clone();
+        let get = |path: String, cookie: Option<String>| {
+            let cookie = cookie
+                .map(|c| format!("cookie: {c}\r\n"))
+                .unwrap_or_default();
+            let addr = server.addr;
+            async move {
+                raw_http(
+                    addr,
+                    format!("GET {path} HTTP/1.0\r\nhost: localhost\r\n{cookie}\r\n").as_bytes(),
+                )
+                .await
+            }
+        };
+        let list = get(
+            "/_wh_admin/requests?path=/hooks".to_string(),
+            Some(cookie.clone()),
+        )
+        .await;
+        assert!(list.contains("/hooks/github"), "{list}");
+        assert!(list.contains(&id), "{list}");
+        let none = get(
+            "/_wh_admin/requests?path=/nothing".to_string(),
+            Some(cookie.clone()),
+        )
+        .await;
+        assert!(none.contains("No requests match"), "{none}");
+        let detail = get(format!("/_wh_admin/requests/{id}"), Some(cookie.clone())).await;
+        assert!(
+            detail.starts_with("HTTP/1.1 200") || detail.starts_with("HTTP/1.0 200"),
+            "{detail}"
+        );
+        assert!(detail.contains("Copy as cURL"), "{detail}");
+        let body = get(
+            format!("/_wh_admin/requests/{id}/body"),
+            Some(cookie.clone()),
+        )
+        .await;
+        assert_eq!(response_body(&body), "body-text");
+        let anonymous = get(format!("/_wh_admin/requests/{id}/body"), None).await;
+        assert!(anonymous.contains(" 303 "), "{anonymous}");
+        let missing = get("/_wh_admin/requests/nope".to_string(), Some(cookie.clone())).await;
+        assert!(missing.contains(" 404 "), "{missing}");
 
         // The admin prefix must not swallow lookalike capture paths.
         let lookalike = raw_http(
@@ -1094,15 +1147,8 @@ mod tests {
         assert_eq!(response_body(&by_query), "01");
         let denied = get_body(&server, &hook_url, None).await;
         assert!(denied.contains(" 401 "), "{denied}");
-        let escape = format!(
-            "/_wh_admin/stream/body/{}",
-            base64::Engine::encode(
-                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                "../../etc/passwd.body.bin"
-            )
-        );
-        let rejected = get_body(&server, &escape, Some("tok")).await;
-        assert!(rejected.contains(" 404 "), "{rejected}");
+        let unknown = get_body(&server, "/_wh_admin/stream/body/..%2F..%2Fetc", Some("tok")).await;
+        assert!(unknown.contains(" 404 "), "{unknown}");
     }
 
     #[tokio::test]
