@@ -283,8 +283,7 @@
       return s;
     };
     const viewer = el("div");
-    const headers = activeToken ? { Authorization: "Bearer " + activeToken } : {};
-    bodyViewer(viewer, ev, ev.body_url, headers);
+    bodyViewer(viewer, ev, ev.body_url, activeToken);
     detail.append(section("Body", viewer), section("Headers", headersTable(ev.headers)));
     return detail;
   }

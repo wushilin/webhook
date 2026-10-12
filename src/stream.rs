@@ -173,7 +173,15 @@ pub async fn serve_body(state: &AppState, id: &str, query: &[(String, String)]) 
         Box::new(file)
     };
 
-    Response::builder()
+    let mut response = Response::builder();
+    if admin::form_value(query, "download").is_some() {
+        // Ids are limited to URL- and filename-safe characters.
+        response = response.header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}.body\"", meta.id),
+        );
+    }
+    response
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CONTENT_SECURITY_POLICY, "sandbox")

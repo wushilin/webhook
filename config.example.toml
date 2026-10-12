@@ -22,6 +22,9 @@ cleanup_interval = "1h"
 # Body files with no matching request (left by a crash mid-capture) are
 # only removed once untouched this long.
 prune_grace = "1h"
+# How often all blob folders are swept for such orphans and for empty
+# folders. The sweep yields after every file, so it never slows captures.
+orphan_sweep_interval = "24h"
 
 [body]
 mode = "compressed" # compressed | raw | metadata_only

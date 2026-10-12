@@ -113,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         retention_worker(cleanup_state).await;
     });
+    let sweep_state = state.clone();
+    tokio::spawn(async move {
+        orphan_sweeper(sweep_state).await;
+    });
     let flush_storage = storage.clone();
     tokio::spawn(async move {
         stats_flusher(flush_storage).await;
@@ -194,9 +198,37 @@ async fn retention_worker(state: AppState) {
     let mut interval = tokio::time::interval(interval_period);
     loop {
         interval.tick().await;
-        if let Err(err) = state.storage.cleanup(&state.config).await {
+        if let Err(err) = state.storage.cleanup().await {
             warn!(error = ?err, "retention cleanup failed");
         }
+    }
+}
+
+/// Sweeps the blob folders for orphans and empty folders. Rare by design: the
+/// first run waits 10 minutes so frequent restarts don't each trigger one.
+async fn orphan_sweeper(state: AppState) {
+    let period = state
+        .config
+        .retention
+        .orphan_sweep_interval
+        .max(std::time::Duration::from_secs(60));
+    let first = tokio::time::Instant::now() + period.min(std::time::Duration::from_secs(600));
+    let mut interval = tokio::time::interval_at(first, period);
+    loop {
+        interval.tick().await;
+        let started = std::time::Instant::now();
+        let report = state
+            .storage
+            .sweep_blobs(state.config.retention.prune_grace)
+            .await;
+        info!(
+            folders = report.folders,
+            files = report.files,
+            orphans_removed = report.orphans_removed,
+            folders_removed = report.folders_removed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "blob sweep finished"
+        );
     }
 }
 

@@ -3,6 +3,8 @@
 (() => {
   "use strict";
   const PREVIEW_BYTES = 256 * 1024;
+  /** Most the viewer will load into the page; Download has no cap. */
+  const VIEW_LIMIT = 5 * 1024 * 1024;
   const HEXDUMP_LIMIT = 64 * 1024;
 
   function el(tag, cls, text) {
@@ -137,17 +139,6 @@
     setTimeout(() => { btn.textContent = label; }, 1200);
   }
 
-  function saveBytes(bytes, name, type) {
-    const url = URL.createObjectURL(new Blob([bytes], { type: type || "application/octet-stream" }));
-    const a = el("a");
-    a.href = url;
-    a.download = name;
-    document.body.append(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
   /** GET a stored body; `headers` carries the stream token where needed. */
   async function fetchBytes(url, limit, headers) {
     const res = await fetch(url + (limit != null ? "?limit=" + limit : ""), { headers: headers || {}, cache: "no-store" });
@@ -163,12 +154,15 @@
 
   /**
    * Fills `container` with a body viewer for request `meta`. The first
-   * PREVIEW_BYTES are fetched from `bodyUrl` straight away; Load all and
-   * Download fetch the whole body.
+   * PREVIEW_BYTES are fetched straight away and "Load all" fetches up to
+   * VIEW_LIMIT. Download is a plain link, so the browser streams the whole
+   * body to disk without holding it in the page. `token` is the stream token
+   * for stream-view cards; admin pages use the session cookie instead.
    */
-  function bodyViewer(container, meta, bodyUrl, headers) {
+  function bodyViewer(container, meta, bodyUrl, token) {
     const body = meta.body || {};
     const size = body.original_size || 0;
+    const headers = token ? { Authorization: "Bearer " + token } : {};
     container.replaceChildren();
 
     if (body.limit_exceeded) {
@@ -190,7 +184,7 @@
     kind.hidden = true;
     const tools = el("span", "tools");
     head.append(kind, el("span", "muted", body.content_type || "no content type"), tools);
-    const info = el("p", "muted", "Loading body…");
+    const info = el("p", "muted", "Loading body\u2026");
     const pre = el("pre");
     pre.hidden = true;
     container.append(head, info, pre);
@@ -201,48 +195,45 @@
       info.className = "error";
       info.textContent = err.message;
     };
-    const render = (bytes, full) => {
-      const complete = full || bytes.length < PREVIEW_BYTES;
+    const loadMore = button(size > VIEW_LIMIT ? `Load first ${humanBytes(VIEW_LIMIT)}` : "Load all", "secondary small", () => {
+      loadMore.disabled = true;
+      loadMore.textContent = "Loading\u2026";
+      fetchBytes(bodyUrl, VIEW_LIMIT, headers).then((b) => render(b, VIEW_LIMIT), fail);
+    });
+    // Fewer bytes than asked for means the whole stored body is here.
+    const render = (bytes, requested) => {
       const view = renderBody(bytes, body.content_type || "");
       loaded = { bytes, view };
       kind.textContent = view.kind;
       kind.hidden = false;
       pre.textContent = view.text;
       pre.hidden = false;
-      if (complete) {
+      if (bytes.length < requested) {
         info.hidden = true;
+        return;
+      }
+      info.className = "viewer-partial";
+      const shown = `Showing the first ${humanBytes(bytes.length)} of ${humanBytes(size)}.`;
+      if (requested < VIEW_LIMIT) {
+        info.replaceChildren(shown, loadMore);
       } else {
-        info.className = "viewer-partial";
-        info.replaceChildren(`Showing the first ${humanBytes(bytes.length)} of ${humanBytes(size)}.`, loadAll);
+        info.replaceChildren(`${shown} Use Download for the full body.`);
       }
     };
-    const loadAll = button("Load all", "secondary small", () => {
-      loadAll.disabled = true;
-      loadAll.textContent = "Loading…";
-      fetchBytes(bodyUrl, null, headers).then((b) => render(b, true), fail);
-    });
 
+    const ct = body.content_type || "";
+    const ext = /json/i.test(ct) ? ".json" : /^text\//i.test(ct) || /x-www-form-urlencoded|xml/i.test(ct) ? ".txt" : ".bin";
+    const download = el("a", "button secondary small", "Download");
+    download.href = bodyUrl + "?download=1" + (token ? "&token=" + encodeURIComponent(token) : "");
+    download.download = (meta.id || "body") + ext;
     tools.append(
       button("Copy", "secondary small", (e) => {
         if (!loaded) return;
         copyText(loaded.view.kind === "Binary" ? bytesToB64(loaded.bytes) : loaded.view.raw, e.currentTarget);
       }),
-      button("Download", "secondary small", async (e) => {
-        const btn = e.currentTarget;
-        btn.disabled = true;
-        try {
-          const bytes = await fetchBytes(bodyUrl, null, headers);
-          const k = loaded ? loaded.view.kind : "";
-          const ext = k === "JSON" ? ".json" : k === "Binary" ? ".bin" : ".txt";
-          saveBytes(bytes, (meta.id || "body") + ext, body.content_type);
-        } catch (err) {
-          fail(err);
-        } finally {
-          btn.disabled = false;
-        }
-      }),
+      download,
     );
-    fetchBytes(bodyUrl, PREVIEW_BYTES, headers).then((b) => render(b, false), fail);
+    fetchBytes(bodyUrl, PREVIEW_BYTES, headers).then((b) => render(b, PREVIEW_BYTES), fail);
   }
 
   function headersTable(headers) {

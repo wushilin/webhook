@@ -23,10 +23,7 @@ use std::{
     collections::BTreeMap,
     ops::AddAssign,
     path::{Component, Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex,
-    },
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -41,10 +38,6 @@ use crate::{config, models::RequestMeta};
 /// the full path is still in the envelope.
 const MAX_KEY_PATH_BYTES: usize = 4096;
 const CLEANUP_BATCH: usize = 1_000;
-const FAN_OUT_DIRS: usize = 0x1_0000;
-/// The sweep visits this many fan-out folders per cleanup pass, so a full
-/// round takes 65,536 / 4,096 = 16 passes.
-const SWEEP_DIRS_PER_PASS: usize = 4_096;
 /// An empty fan-out folder is removed only once untouched this long. Deleting
 /// a blob updates its folder's mtime, and writers touch the folder before
 /// creating a blob, so a folder in use is never older than this.
@@ -70,7 +63,6 @@ pub struct Storage {
     pending: Mutex<BTreeMap<u64, Counts>>,
     /// Serializes stats flushes, which read-modify-write buckets.
     flush_lock: tokio::sync::Mutex<()>,
-    sweep_cursor: AtomicUsize,
 }
 
 /// Where a request's body goes: the absolute file path plus the path relative
@@ -209,6 +201,22 @@ impl Granularity {
     }
 }
 
+/// What one blob sweep did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepReport {
+    pub folders: usize,
+    pub files: usize,
+    pub orphans_removed: usize,
+    pub folders_removed: usize,
+}
+
+enum BlobCheck {
+    Kept,
+    Removed,
+    /// Already deleted by someone else.
+    Gone,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct StoreTotals {
     pub stored_requests: usize,
@@ -237,7 +245,6 @@ impl Storage {
             blobs: blobs.to_path_buf(),
             pending: Mutex::new(BTreeMap::new()),
             flush_lock: tokio::sync::Mutex::new(()),
-            sweep_cursor: AtomicUsize::new(0),
         })
     }
 
@@ -453,8 +460,8 @@ impl Storage {
     // ---------- retention ----------
 
     /// Deletes every request whose expiry has passed and stats buckets past
-    /// their keep window, then sweeps a slice of the blob fan-out.
-    pub async fn cleanup(&self, config: &config::Config) -> anyhow::Result<()> {
+    /// their keep window. Orphan blobs are left to [`Storage::sweep_blobs`].
+    pub async fn cleanup(&self) -> anyhow::Result<()> {
         let now = SystemTime::now();
         let mut removed = 0usize;
         loop {
@@ -478,7 +485,6 @@ impl Storage {
             info!(removed, "retention removed expired requests");
         }
         self.prune_stats(now).await?;
-        self.sweep_blobs(config.retention.prune_grace).await;
         Ok(())
     }
 
@@ -557,58 +563,86 @@ impl Storage {
         .await?
     }
 
-    /// Visits the next slice of fan-out folders: removes orphan blobs (no
-    /// envelope, untouched for `orphan_grace`) and folders left empty and
-    /// untouched for [`EMPTY_DIR_GRACE`].
-    async fn sweep_blobs(&self, orphan_grace: Duration) {
-        let start = self
-            .sweep_cursor
-            .fetch_add(SWEEP_DIRS_PER_PASS, Ordering::Relaxed)
-            % FAN_OUT_DIRS;
-        let in_slice = |name: &str| {
-            let Ok(index) = usize::from_str_radix(name, 16) else {
-                return false;
+    /// One full pass over the blob fan-out: removes orphan blobs (no
+    /// envelope, untouched for `orphan_grace`) and folders that are empty and
+    /// untouched for [`EMPTY_DIR_GRACE`]. Runs rarely, yields to the runtime
+    /// after every entry, and treats anything that vanishes underneath it
+    /// (deleted by retention or by hand) as already handled.
+    pub async fn sweep_blobs(&self, orphan_grace: Duration) -> SweepReport {
+        let mut report = SweepReport::default();
+        let mut dirs = match fs::read_dir(&self.blobs).await {
+            Ok(dirs) => dirs,
+            Err(err) => {
+                warn!(error = ?err, path = %self.blobs.display(), "blob sweep could not list the blob root");
+                return report;
+            }
+        };
+        loop {
+            let dir = match dirs.next_entry().await {
+                Ok(Some(dir)) => dir,
+                Ok(None) => break,
+                Err(err) => {
+                    warn!(error = ?err, "blob sweep stopped listing the blob root");
+                    break;
+                }
             };
-            name.len() == 4 && (index + FAN_OUT_DIRS - start) % FAN_OUT_DIRS < SWEEP_DIRS_PER_PASS
-        };
-        let Ok(mut dirs) = fs::read_dir(&self.blobs).await else {
-            return;
-        };
-        while let Ok(Some(dir)) = dirs.next_entry().await {
-            let name = dir.file_name();
-            if !name.to_str().is_some_and(in_slice) {
+            tokio::task::yield_now().await;
+            let is_fan_out = dir
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.len() == 4 && n.bytes().all(|b| b.is_ascii_hexdigit()));
+            if !is_fan_out {
                 continue;
             }
+            report.folders += 1;
             let path = dir.path();
+            // A folder removed since the listing is simply skipped.
             let Ok(mut files) = fs::read_dir(&path).await else {
                 continue;
             };
             let mut remaining = 0usize;
-            while let Ok(Some(file)) = files.next_entry().await {
-                if !self.remove_if_orphan(&file.path(), orphan_grace).await {
-                    remaining += 1;
+            let mut complete = true;
+            loop {
+                let file = match files.next_entry().await {
+                    Ok(Some(file)) => file,
+                    Ok(None) => break,
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                };
+                report.files += 1;
+                match self.remove_if_orphan(&file.path(), orphan_grace).await {
+                    BlobCheck::Kept => remaining += 1,
+                    BlobCheck::Removed => report.orphans_removed += 1,
+                    BlobCheck::Gone => {}
+                }
+                tokio::task::yield_now().await;
+            }
+            // remove_dir refuses a folder a writer has filled since; a
+            // folder already removed is fine too.
+            if complete && remaining == 0 && is_older_than(&path, EMPTY_DIR_GRACE).await {
+                match fs::remove_dir(&path).await {
+                    Ok(()) => report.folders_removed += 1,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {}
                 }
             }
-            // remove_dir refuses a folder a writer has just filled.
-            if remaining == 0 && is_older_than(&path, EMPTY_DIR_GRACE).await {
-                let _ = fs::remove_dir(&path).await;
-            }
         }
+        report
     }
 
-    /// Returns true when `file` was an orphan and has been removed.
-    async fn remove_if_orphan(&self, file: &Path, grace: Duration) -> bool {
+    async fn remove_if_orphan(&self, file: &Path, grace: Duration) -> BlobCheck {
         let Some(id) = file
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|name| BODY_SUFFIXES.iter().find_map(|s| name.strip_suffix(s)))
         else {
-            return false;
+            return BlobCheck::Kept;
         };
-        // A blob still being written keeps a fresh mtime.
-        if !is_older_than(file, grace).await {
-            return false;
-        }
+        // A point lookup by id (bloom-filtered, usually at most one disk
+        // read) comes first, so live blobs cost no stat on the blob store.
+        // On any lookup failure, assume the blob is wanted.
         let envelopes = self.envelopes.clone();
         let key = id.as_bytes().to_vec();
         let known = tokio::task::spawn_blocking(move || envelopes.contains_key(key))
@@ -616,7 +650,26 @@ impl Storage {
             .ok()
             .and_then(Result::ok)
             .unwrap_or(true);
-        !known && fs::remove_file(file).await.is_ok()
+        if known {
+            return BlobCheck::Kept;
+        }
+        // An unknown blob may still be mid-write: its mtime is then fresh.
+        let mtime = match fs::metadata(file).await.and_then(|m| m.modified()) {
+            Ok(mtime) => mtime,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return BlobCheck::Gone,
+            Err(_) => return BlobCheck::Kept,
+        };
+        if SystemTime::now()
+            .duration_since(mtime)
+            .map_or(true, |age| age < grace)
+        {
+            return BlobCheck::Kept;
+        }
+        match fs::remove_file(file).await {
+            Ok(()) => BlobCheck::Removed,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => BlobCheck::Gone,
+            Err(_) => BlobCheck::Kept,
+        }
     }
 }
 
@@ -965,7 +1018,7 @@ mod tests {
             .await
             .unwrap();
 
-        storage.cleanup(&config::Config::default()).await.unwrap();
+        storage.cleanup().await.unwrap();
 
         assert!(storage.get("gone").await.unwrap().is_none());
         assert!(!location.path.exists());
@@ -977,8 +1030,6 @@ mod tests {
     async fn sweep_removes_orphans_and_only_stale_empty_folders() {
         let tmp = TempDir::new().unwrap();
         let storage = open(&tmp);
-        let mut config = config::Config::default();
-        config.retention.prune_grace = Duration::ZERO;
 
         let orphan = storage
             .blob_location("orphan", config::BodyMode::Compressed)
@@ -1000,16 +1051,40 @@ mod tests {
         std::fs::create_dir_all(&fresh).unwrap();
         age(&stale, EMPTY_DIR_GRACE + Duration::from_secs(60));
 
-        // 16 passes cover all 65,536 fan-out folders.
-        for _ in 0..16 {
-            storage.cleanup(&config).await.unwrap();
-        }
+        // A non-blob file is never touched.
+        let note = live.path.with_file_name("README.txt");
+        std::fs::write(&note, "keep").unwrap();
+
+        let report = storage.sweep_blobs(Duration::ZERO).await;
+        assert_eq!(report.orphans_removed, 1);
+        assert_eq!(report.folders_removed, 1);
+        assert!(note.exists());
         assert!(!orphan.path.exists());
         assert!(live.path.exists());
         assert!(!stale.exists());
         assert!(fresh.exists());
         // The orphan's folder was just modified by the delete, so it stays.
         assert!(orphan.path.parent().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn sweep_treats_vanished_files_and_folders_as_handled() {
+        let tmp = TempDir::new().unwrap();
+        let storage = open(&tmp);
+
+        // A blob deleted by someone else between listing and checking.
+        let gone = tmp.path().join("blobs/0000/gone.body.bin");
+        assert!(matches!(
+            storage.remove_if_orphan(&gone, Duration::ZERO).await,
+            BlobCheck::Gone
+        ));
+
+        // The whole blob root removed by hand: the sweep reports nothing.
+        std::fs::remove_dir_all(tmp.path().join("blobs")).unwrap();
+        assert_eq!(
+            storage.sweep_blobs(Duration::ZERO).await,
+            SweepReport::default()
+        );
     }
 
     #[tokio::test]

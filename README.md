@@ -114,6 +114,7 @@ min_ttl = "2h"                 # shorter per-path TTLs are raised to this floor
 cleanup_interval = "1h"        # how often the cleanup worker runs
 prune_grace = "1h"             # orphaned body files are only removed once
                                # untouched this long
+orphan_sweep_interval = "24h"  # how often blob folders are swept for orphans
 
 [body]
 mode = "compressed"            # compressed | raw | metadata_only
@@ -213,6 +214,7 @@ $ webhook verifypassword
 | `min_ttl` | `2h` | Minimum effective TTL; shorter configured TTLs are coalesced to this value |
 | `cleanup_interval` | `1h` | How often the cleanup worker runs |
 | `prune_grace` | `1h` | A body file with no matching request (left by a crash mid-capture) is only removed once untouched this long |
+| `orphan_sweep_interval` | `24h` | How often all blob folders are swept for orphan body files and empty folders (see *Retention and cleanup*) |
 
 ### `[body]`
 
@@ -295,12 +297,14 @@ Creating a body file is retried as a whole: create the folder, touch it (update 
 
 At capture time the server resolves the path rule and records an expiry of `received_at + max(rule_ttl, min_ttl)` in the `expiry` index. Every `cleanup_interval`, cleanup reads that index from the start up to now and, for each expired request, deletes its body file and its database entries. The cost is proportional to the number of expired requests, not to how much is stored or how many distinct paths there are.
 
-Each pass also sweeps 4,096 of the 65,536 blob folders, so a full round takes 16 passes. In each folder it:
+Orphan cleanup runs separately and rarely: every `orphan_sweep_interval` (default 24 hours, first run 10 minutes after startup) one sweep visits all 65,536 blob folders. It yields to the runtime after every file and folder, so captures and the admin UI always go first. In each folder it:
 
-- removes **orphan** body files: no matching metadata, and untouched for `prune_grace`. Orphans only come from a crash between writing a body and committing its metadata.
+- removes **orphan** body files. The file name is the request id, so each check starts with a point lookup in the database (bloom-filtered, usually at most one disk read); only a file with no matching request is then stat-ed, and removed if untouched for `prune_grace`. Orphans only come from a crash between writing a body and committing its metadata.
 - removes the folder itself if it is **empty and untouched for 30 minutes**. Deleting a body file updates its folder's modification time, and writers touch the folder before creating a file, so a folder in use never qualifies; a writer that loses the race anyway retries (see above).
 
-Old overview counts are dropped too: minute buckets after 2 days, hour buckets after 90 days.
+The sweep is fail-safe: a file or folder that something else deleted in the meantime counts as already handled, a folder that can't be listed is skipped, and a failed database lookup keeps the file. It logs what it did when it finishes.
+
+The hourly cleanup also drops old overview counts: minute buckets after 2 days, hour buckets after 90 days.
 
 ## Admin UI
 

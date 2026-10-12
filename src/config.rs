@@ -81,6 +81,9 @@ pub struct RetentionConfig {
     pub cleanup_interval: Duration,
     #[serde(default = "default_prune_grace", with = "humantime_serde")]
     pub prune_grace: Duration,
+    /// How often the blob folders are swept for orphans and empty folders.
+    #[serde(default = "default_orphan_sweep_interval", with = "humantime_serde")]
+    pub orphan_sweep_interval: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -349,6 +352,9 @@ cleanup_interval = "1h"
 # Body files with no matching request (left by a crash mid-capture) are
 # only removed once untouched this long.
 prune_grace = "1h"
+# How often all blob folders are swept for such orphans and for empty
+# folders. The sweep yields after every file, so it never slows captures.
+orphan_sweep_interval = "24h"
 
 [body]
 mode = "compressed" # compressed | raw | metadata_only
@@ -414,6 +420,7 @@ impl Default for RetentionConfig {
             min_ttl: default_min_ttl(),
             cleanup_interval: default_cleanup_interval(),
             prune_grace: default_prune_grace(),
+            orphan_sweep_interval: default_orphan_sweep_interval(),
         }
     }
 }
@@ -477,6 +484,10 @@ fn default_min_ttl() -> Duration {
 
 fn default_cleanup_interval() -> Duration {
     Duration::from_secs(60 * 60)
+}
+
+fn default_orphan_sweep_interval() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
 }
 
 fn default_prune_grace() -> Duration {
@@ -629,6 +640,10 @@ admin_prefix = "/_custom_admin///"
             default.retention.cleanup_interval
         );
         assert_eq!(parsed.retention.prune_grace, default.retention.prune_grace);
+        assert_eq!(
+            parsed.retention.orphan_sweep_interval,
+            default.retention.orphan_sweep_interval
+        );
         assert_eq!(parsed.body.mode, default.body.mode);
         assert_eq!(parsed.body.preview_limit, default.body.preview_limit);
         assert_eq!(parsed.body.max_body_size, default.body.max_body_size);
