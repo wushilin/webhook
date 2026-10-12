@@ -306,7 +306,7 @@ Paths that merely resemble the admin prefix (e.g. `/_wh_adminfoo`) are still cap
 
 Every connection is an independent consumer that receives its own copy of every event. A slow consumer never holds up the others or the capture path. If a consumer falls more than `stream.buffer` events behind, it loses its oldest events. Events from before you connect are not replayed.
 
-Add `?prefix=/api/v1` to receive only requests whose path is `/api/v1` or is under `/api/v1/`, using the same matching as `[[paths]]` rules.
+Add `?prefix=/api/v1` to receive only requests whose path starts with `/api/v1`. This is a plain string match, so `/api/v1` also matches `/api/v1x`; use `/api/v1/` to match only paths under `/api/v1/`. A leading `/` is added if you leave it out.
 
 ```sh
 websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/stream?prefix=/api/v1'

@@ -1054,6 +1054,12 @@ mod tests {
             b"POST /api/v1/hook HTTP/1.1\r\nhost: localhost\r\ncontent-length: 10\r\nconnection: close\r\n\r\n0123456789",
         )
         .await;
+        // The prefix is a plain string prefix, not a path segment.
+        raw_http(
+            server.addr,
+            b"POST /api/v1x HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
 
         for ws in [&mut all_a, &mut all_b] {
             let first = next_stream_event(ws).await;
@@ -1079,10 +1085,12 @@ mod tests {
                 second["body_truncated_reason"],
                 "body too big for streaming"
             );
+            assert_eq!(next_stream_event(ws).await["path"], "/api/v1x");
         }
 
         let filtered = next_stream_event(&mut only_api).await;
         assert_eq!(filtered["path"], "/api/v1/hook");
+        assert_eq!(next_stream_event(&mut only_api).await["path"], "/api/v1x");
     }
 
     #[tokio::test]

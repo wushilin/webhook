@@ -53,6 +53,7 @@
   };
 
   let ws = null, wanted = false, opened = false, retry = 0, retryTimer = null;
+  let activePrefix = "", prefixTimer = null;
   let paused = false, pending = [], dropped = 0, received = 0;
 
   // ?token=&prefix= prefill the form; the token is then stripped from the address bar.
@@ -68,10 +69,15 @@
 
   // ---------- connection ----------
 
+  function currentPrefix() {
+    const prefix = els.prefix.value.trim();
+    return prefix && !prefix.startsWith("/") ? "/" + prefix : prefix;
+  }
+
   function streamUrl() {
     const q = new URLSearchParams();
     const token = els.token.value.trim();
-    const prefix = els.prefix.value.trim();
+    const prefix = currentPrefix();
     if (token) q.set("token", token);
     if (prefix) q.set("prefix", prefix);
     const scheme = location.protocol === "https:" ? "wss://" : "ws://";
@@ -83,6 +89,7 @@
     clearTimeout(retryTimer);
     const sock = new WebSocket(streamUrl());
     ws = sock;
+    activePrefix = currentPrefix();
     opened = false;
     setStatus("connecting", "Connecting…");
     sock.onopen = () => {
@@ -125,8 +132,9 @@
   }
 
   function connect() {
+    clearTimeout(prefixTimer);
     storage.set("wh.stream.token", els.token.value.trim());
-    storage.set("wh.stream.prefix", els.prefix.value.trim());
+    storage.set("wh.stream.prefix", currentPrefix());
     wanted = true;
     retry = 0;
     closeSocket();
@@ -153,8 +161,9 @@
 
   function showConnectedStatus() {
     if (!ws || !opened) return;
-    if (paused) setStatus("paused", "Paused · stream still running");
-    else setStatus("live", "Live");
+    const scope = activePrefix ? ` · ${activePrefix}` : " · all paths";
+    if (paused) setStatus("paused", "Paused · stream still running" + scope);
+    else setStatus("live", "Live" + scope);
   }
 
   // ---------- pause / list ----------
@@ -361,10 +370,12 @@
     if (/json/i.test(contentType) || trimmed.startsWith("{") || trimmed.startsWith("[")) {
       try { return { kind: "JSON", text: JSON.stringify(JSON.parse(raw), null, 2), raw }; } catch (_) {}
     }
-    if (/x-www-form-urlencoded/i.test(contentType)) {
+    // curl -d/--data-binary labels any body as a form, so only treat it as one
+    // when every field really is key=value.
+    if (/x-www-form-urlencoded/i.test(contentType) && looksLikeForm(raw)) {
       const lines = [];
       for (const [k, v] of new URLSearchParams(raw)) lines.push(`${k} = ${v}`);
-      if (lines.length) return { kind: "Form", text: lines.join("\n"), raw };
+      return { kind: "Form", text: lines.join("\n"), raw };
     }
     return { kind: "Text", text: raw, raw };
   }
@@ -447,6 +458,11 @@
     return control / bytes.length > 0.1;
   }
 
+  function looksLikeForm(text) {
+    const fields = text.trim().split("&");
+    return text.trim() !== "" && fields.every((f) => /^[^=\s]+=[^\s]*$/.test(f));
+  }
+
   function hexdump(bytes) {
     const lines = [];
     for (let off = 0; off < bytes.length; off += 16) {
@@ -512,6 +528,14 @@
   // ---------- wiring ----------
 
   els.form.addEventListener("submit", (e) => { e.preventDefault(); connect(); });
+  // A changed prefix applies by itself shortly after typing stops.
+  els.prefix.addEventListener("input", () => {
+    clearTimeout(prefixTimer);
+    if (!wanted) return;
+    prefixTimer = setTimeout(() => {
+      if (wanted && currentPrefix() !== activePrefix) connect();
+    }, 700);
+  });
   els.disconnect.addEventListener("click", disconnect);
   els.pause.addEventListener("click", () => setPaused(!paused));
   els.resume.addEventListener("click", () => setPaused(false));

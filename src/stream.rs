@@ -139,7 +139,7 @@ pub async fn handle(state: AppState, req: Request<Body>) -> Response {
             return (StatusCode::UNAUTHORIZED, "invalid stream token\n").into_response();
         }
     }
-    let prefix = admin::form_value(&query, "prefix").filter(|p| !p.is_empty());
+    let prefix = admin::form_value(&query, "prefix").and_then(|p| normalize_prefix(&p));
 
     let (mut parts, _body) = req.into_parts();
     let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
@@ -153,6 +153,18 @@ pub async fn handle(state: AppState, req: Request<Body>) -> Response {
         consume(socket, rx, prefix).await;
         drop(guard);
     })
+}
+
+/// `asdf` and ` /asdf ` both mean `/asdf`; paths always start with `/`.
+fn normalize_prefix(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else if trimmed.starts_with('/') {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("/{trimmed}"))
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -171,7 +183,7 @@ async fn consume(mut socket: WebSocket, rx: Receiver<StreamEvent>, prefix: Optio
                 Ok(event) => {
                     if prefix
                         .as_deref()
-                        .is_some_and(|prefix| !config::path_matches(&event.path, prefix))
+                        .is_some_and(|prefix| !event.path.starts_with(prefix))
                     {
                         continue;
                     }
@@ -192,4 +204,16 @@ async fn consume(mut socket: WebSocket, rx: Receiver<StreamEvent>, prefix: Optio
         }
     }
     info!("stream consumer disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_prefix;
+
+    #[test]
+    fn prefix_gets_leading_slash_and_blank_means_all() {
+        assert_eq!(normalize_prefix("/asdf").as_deref(), Some("/asdf"));
+        assert_eq!(normalize_prefix(" asdf ").as_deref(), Some("/asdf"));
+        assert_eq!(normalize_prefix("  "), None);
+    }
 }
