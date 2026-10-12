@@ -6,15 +6,13 @@ Useful for debugging third-party webhook integrations, inspecting what a client 
 
 ## Features
 
-- **Catch-all capture** — every method (`GET`, `POST`, `PUT`, ...) on every non-admin path is recorded.
+- **Catch-all capture** — every method (`GET`, `POST`, `PUT`, ...) on every non-admin path is recorded: method, path, query, headers, timing and body.
 - **Streamed body persistence** — bodies are written to disk as they arrive (never buffered whole in memory), optionally gzip-compressed, with configurable size limits.
-- **JSON metadata sidecar** — method, path, query, headers, timing, and body stats stored as JSON next to each body file.
-- **Path/time-partitioned storage layout** — records are laid out by request path and timestamp for easy `find`/`grep`.
-- **Indexed storage** — request metadata lives in an embedded [fjall](https://github.com/fjall-rs/fjall) database indexed by time and path; bodies are files in a fixed hashed fan-out of folders. Search, detail lookups and retention never walk a directory tree.
-- **TTL-based retention** — an expiry index lets cleanup delete exactly the requests that have expired, however many paths you capture.
+- **Indexed storage** — request metadata lives in an embedded [fjall](https://github.com/fjall-rs/fjall) database indexed by time and path; bodies are files in a fixed, hashed one-level fan-out of 65,536 folders. Every read is a lookup by id or a bounded key range — nothing scans a whole table or walks a directory tree, however many requests or distinct paths you capture.
+- **TTL-based retention** — an expiry index lets cleanup delete exactly the requests that have expired; a rare, low-priority sweep removes orphan body files and empty folders.
 - **Configurable responses** — global and per-path-prefix response status, headers, and body (capture metadata JSON, static text, or static JSON).
-- **Admin UI** — overview, a request explorer that searches everything retained by path prefix and time range, request detail pages with a formatted body viewer and *Copy as cURL*, and a live stream view. Protected by an optional login (bcrypt password, in-memory sessions). Light and dark themes.
-- **Safe filesystem mapping** — URL path segments are reversibly percent-encoded for filesystem use; the original path is always preserved verbatim in metadata.
+- **Admin UI** — an overview with request counts and a chart for the last hour, day, week or month; a request explorer that searches everything retained by path prefix and time range; request detail pages with a formatted body viewer, download and *Copy as cURL*; and a live stream view. Protected by an optional login (bcrypt password, in-memory sessions). Light and dark themes.
+- **Live request stream** — a token-protected WebSocket that pushes a small JSON envelope for every captured request, with an optional path-prefix filter; bodies are fetched on demand from a REST endpoint.
 
 ## Quick start
 
@@ -46,7 +44,7 @@ Response:
 ```json
 {
   "success": true,
-  "id": "31_922460000_myhost_AbCdEf1234567890",
+  "id": "20261012T082031.922460000Z_myhost_AbCdEf123456",
   "complete": true,
   "body_stored": true,
   "total_bytes_in": 456,
@@ -118,7 +116,7 @@ orphan_sweep_interval = "24h"  # how often blob folders are swept for orphans
 
 [body]
 mode = "compressed"            # compressed | raw | metadata_only
-preview_limit = "5MiB"         # max original body size shown in the admin UI preview
+preview_limit = "5MiB"         # bodies up to this size get previewable = true in metadata
 max_body_size = "100MiB"       # requests with a larger body are rejected with 413
 
 [stream]
@@ -175,14 +173,14 @@ Durations use [humantime](https://docs.rs/humantime) syntax (`30d`, `1h`, `15m`,
 | `username` | `admin` | Admin login username |
 | `password` | *(unset)* | bcrypt hash (recommended) or plaintext. When unset, the admin UI is **open** and a warning is logged at startup |
 
+Login sessions are kept in memory, so restarting the server signs everyone out. Captured requests are in the database and survive restarts.
+
 ### `[stream]`
 
 | Key | Default | Description |
 |---|---|---|
 | `token` | *(unset)* | Token required to open the request stream. When unset, the stream is **open** to anyone and a warning is logged at startup |
 | `buffer` | `1024` | Events buffered per consumer. A consumer that falls further behind loses its oldest events |
-
-Sessions and the recent-request browser are kept in memory — restarting the server signs everyone out and starts a new recent-request view.
 
 Generate a password hash:
 
@@ -221,7 +219,7 @@ $ webhook verifypassword
 | Key | Default | Description |
 |---|---|---|
 | `mode` | `compressed` | `compressed` (gzip), `raw` (as received), or `metadata_only` (body counted but not stored) |
-| `preview_limit` | `5MiB` | Bodies up to this original size are previewable in the admin UI (must be ≤ `max_body_size`) |
+| `preview_limit` | `5MiB` | Sets the `previewable` flag in each request's metadata for bodies up to this original size (must be ≤ `max_body_size`). The admin body viewer loads any stored body on demand regardless |
 | `max_body_size` | `100MiB` | Larger bodies are rejected with `413 Payload Too Large` |
 
 ### `[responder]` and `[[responders]]`
@@ -314,7 +312,7 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 |---|---|
 | `/_wh_admin/` | Overview for the last 1 hour, 24 hours, 7 days or 30 days: requests, complete, incomplete, limit exceeded and body bytes, a requests-over-time chart (hover a column for its numbers, or *Show as table*), the method breakdown, and stored totals. Built from the counts buckets: at most 1,440 minute or 720 hour keys per view, and the counts survive restarts |
 | `/_wh_admin/requests` | Request explorer. Searches **everything retained**, newest first, by path prefix (`?path=`, a plain string prefix) and time range (quick ranges or a custom from/to in the server's time zone), 100 per page with an *Older* link. If a rare prefix doesn't fill a page within the scan budget, the page says how far back it searched and offers to keep going |
-| `/_wh_admin/requests/<id>` | Request detail: status, sizes, and Body / Headers / Query / Raw tabs. The body loads on demand (first 256KiB, then *Load all*) and is shown as formatted JSON, form fields, text or a hex dump. *Copy as cURL* rebuilds the request |
+| `/_wh_admin/requests/<id>` | Request detail: status, sizes, and Body / Headers / Query / Raw tabs. The body loads on demand — the first 256KiB, then *Load all* (*Load first 5 MiB* for larger bodies; the page never holds more than 5MiB) — and is shown as formatted JSON, form fields, text or a hex dump. *Download* saves the whole body of any size straight to disk. *Copy as cURL* rebuilds the request |
 | `/_wh_admin/requests/<id>/body` | The stored body, behind the admin login (same responses as the stream body endpoint below) |
 | `/_wh_admin/login`, `/logout` | Session login/logout (only when `admin.password` is set) |
 | `/_wh_admin/stream` | WebSocket stream of captured requests (see below) |
@@ -322,12 +320,24 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 
 Paths that merely resemble the admin prefix (e.g. `/_wh_adminfoo`) are still captured as webhooks.
 
+## Request stream
+
+`/_wh_admin/stream` is a WebSocket that pushes one JSON text message for each request captured after you connect. It uses `stream.token` rather than the admin login, sent as `Authorization: Bearer <token>` or `?token=<token>`. If `stream.token` is unset, the stream needs no token.
+
+Every connection is an independent consumer that receives its own copy of every event. A slow consumer never holds up the others or the capture path. If a consumer falls more than `stream.buffer` events behind, it loses its oldest events. Events from before you connect are not replayed.
+
+Add `?prefix=/api/v1` to receive only requests whose path starts with `/api/v1`. This is a plain string match, so `/api/v1` also matches `/api/v1x`; use `/api/v1/` to match only paths under `/api/v1/`. A leading `/` is added if you leave it out.
+
+```sh
+websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/stream?prefix=/api/v1'
+```
+
 ### Live view
 
 `/_wh_admin/streamview` shows the stream in the browser. Enter the stream token and an optional path prefix, and new requests appear on top as cards. Click a card to expand it and see:
 
 - **Summary:** size and receive time, with a link to the full request page.
-- **Body:** fetched from the body endpoint only when you expand the card, first 256KiB, with a **Load all** button for the rest. It's shown as pretty-printed JSON, a form field list, plain text, or a hex dump for binary bodies, with buttons to copy or download it.
+- **Body:** fetched from the body endpoint only when you expand the card — the first 256KiB, then **Load all** (capped at 5MiB in the page). It's shown as pretty-printed JSON, a form field list, plain text, or a hex dump for binary bodies, with buttons to copy it or download the whole body.
 - **Headers:** every header.
 
 **Pause** only freezes the page. The WebSocket stays connected, and new requests wait in a banner until you resume. The page keeps the latest 500 cards and drops the oldest. It reconnects automatically if the connection drops.
@@ -381,6 +391,7 @@ Example (formatted here for readability; on the wire it is a single line):
 
 - **Lookup:** the last part of `body_url` is the request id. It works for as long as the request is retained (`retention.default_ttl`), not only while it's in the live stream.
 - **`?limit=N`:** returns only the first N bytes of the body. Without it you get the whole body, streamed from disk and gunzipped on the fly, so even large bodies aren't buffered in memory.
+- **`?download=1`:** adds `Content-Disposition: attachment; filename="<id>.body"`, so a browser link saves the body to disk.
 - **Response:** always `application/octet-stream` with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so a captured HTML or script body can never run on the admin origin. Use `body.content_type` from the envelope for the original type.
 - **Errors:** 401 for a missing or wrong token, 404 for an unknown id, a request without a stored body, or an expired one.
 - **Partial bodies:** for incomplete or limit-exceeded requests you get exactly what was stored, which can be shorter than `body.original_size`.
@@ -392,8 +403,17 @@ curl -H 'Authorization: Bearer change-me' "http://127.0.0.1:8080$BODY_URL?limit=
 ## Development
 
 ```sh
-cargo test    # integration tests drive a real TCP listener
+cargo test    # unit tests plus integration tests that drive a real TCP listener
 cargo build --release
+```
+
+The admin UI's stylesheet and scripts live in `src/ui/` and are compiled into the binary; there is no separate frontend build.
+
+To cut a release, bump `version` in `Cargo.toml`, commit, then push a tag:
+
+```sh
+git tag -a v0.2.0 -m "webhook 0.2.0"
+git push origin v0.2.0
 ```
 
 ## License
