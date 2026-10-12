@@ -322,7 +322,7 @@ Paths that merely resemble the admin prefix (e.g. `/_wh_adminfoo`) are still cap
 
 ## Request stream
 
-`/_wh_admin/stream` is a WebSocket that pushes one JSON text message for each request captured after you connect. It is meant for clients and scripts that never log in, so it uses `stream.token` rather than the admin login, sent as `Authorization: Bearer <token>` or `?token=<token>`. If `stream.token` is unset, the stream needs no token.
+`/_wh_admin/stream` is a WebSocket that pushes one JSON text message for each request captured after you connect. It is meant for clients and scripts that never log in, so it uses `stream.token` rather than the admin login, sent as an `X-Stream-Token: <token>` header, `Authorization: Bearer <token>`, or `?token=<token>` (checked in that order). Prefer the header: query strings end up in proxy logs and shell history, and some proxies claim `Authorization` for themselves. If `stream.token` is unset, the stream needs no token.
 
 Every connection is an independent consumer that receives its own copy of every event. A slow consumer never holds up the others or the capture path. If a consumer falls more than `stream.buffer` events behind, it loses its oldest events. Events from before you connect are not replayed.
 
@@ -337,7 +337,7 @@ websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/str
 The same endpoint also serves clients that don't speak WebSocket. A plain `GET` (no `Upgrade: websocket` header) gets a never-ending `application/x-ndjson` response: one envelope per line, in the same format as the WebSocket messages, with the same token and `?prefix=` rules. While idle it sends a blank line every 30 seconds so proxies don't close the connection.
 
 ```sh
-curl -sN 'https://example.com/_wh_admin/stream?token=change-me&prefix=/api/v1' | jq .
+curl -sN -H 'X-Stream-Token: change-me' 'https://example.com/_wh_admin/stream?prefix=/api/v1' | jq .
 ```
 
 The live view page shows this command, with your token and current prefix filled in, in a code block with a *Copy* button.
@@ -399,7 +399,7 @@ Example (formatted here for readability; on the wire it is a single line):
 
 ### Fetching a body
 
-`GET <body_url>` returns the original, uncompressed body as stored on disk. It uses the same token rules as the stream (`Authorization: Bearer <token>` or `?token=`).
+`GET <body_url>` returns the original, uncompressed body as stored on disk. It uses the same token rules as the stream (`X-Stream-Token`, `Authorization: Bearer`, or `?token=`).
 
 - **Lookup:** the last part of `body_url` is the request id. It works for as long as the request is retained (`retention.default_ttl`), not only while it's in the live stream.
 - **`?limit=N`:** returns only the first N bytes of the body. Without it you get the whole body, streamed from disk and gunzipped on the fly, so even large bodies aren't buffered in memory.
@@ -409,7 +409,7 @@ Example (formatted here for readability; on the wire it is a single line):
 - **Partial bodies:** for incomplete or limit-exceeded requests you get exactly what was stored, which can be shorter than `body.original_size`.
 
 ```sh
-curl -H 'Authorization: Bearer change-me' "http://127.0.0.1:8080$BODY_URL?limit=1024"
+curl -H 'X-Stream-Token: change-me' "http://127.0.0.1:8080$BODY_URL?limit=1024"
 ```
 
 ## Development
@@ -424,8 +424,8 @@ The admin UI's stylesheet and scripts live in `src/ui/` and are compiled into th
 To cut a release, bump `version` in `Cargo.toml`, commit, then push a tag:
 
 ```sh
-git tag -a v0.2.2 -m "webhook 0.2.2"
-git push origin v0.2.2
+git tag -a v0.2.3 -m "webhook 0.2.3"
+git push origin v0.2.3
 ```
 
 ## License

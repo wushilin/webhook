@@ -98,7 +98,9 @@ fn authorize(state: &AppState, headers: &HeaderMap, query: &[(String, String)]) 
     let Some(expected) = state.config.stream.token.as_deref() else {
         return true;
     };
-    bearer_token(headers)
+    // X-Stream-Token first: it survives proxies that claim Authorization.
+    header_token(headers)
+        .or_else(|| bearer_token(headers))
         .or_else(|| admin::form_value(query, "token"))
         .is_some_and(|t| admin::constant_time_eq(t.as_bytes(), expected.as_bytes()))
 }
@@ -244,6 +246,13 @@ fn normalize_prefix(raw: &str) -> Option<String> {
     } else {
         Some(format!("/{trimmed}"))
     }
+}
+
+fn header_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-stream-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {

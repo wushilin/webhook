@@ -72,16 +72,16 @@
     return prefix && !prefix.startsWith("/") ? "/" + prefix : prefix;
   }
 
-  /** The same stream as NDJSON over plain HTTP, for curl. */
+  /** The same stream as NDJSON over plain HTTP, for curl. The token goes in a
+   * header so it stays out of proxy logs and shell-history URLs. */
   function curlCommand() {
-    const q = new URLSearchParams();
-    if (STREAM_TOKEN) q.set("token", STREAM_TOKEN);
+    const quote = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
     const prefix = currentPrefix();
-    if (prefix) q.set("prefix", prefix);
     // Slashes are legal in a query string; leaving them readable.
-    const qs = q.toString().replace(/%2F/gi, "/");
-    const url = location.origin + ADMIN_PREFIX + "/stream" + (qs ? "?" + qs : "");
-    return `curl -sN '${url.replace(/'/g, "'\\''")}'`;
+    const qs = prefix ? "?prefix=" + encodeURIComponent(prefix).replace(/%2F/gi, "/") : "";
+    const url = location.origin + ADMIN_PREFIX + "/stream" + qs;
+    const auth = STREAM_TOKEN ? ` -H ${quote("X-Stream-Token: " + STREAM_TOKEN)}` : "";
+    return `curl -sN${auth} ${quote(url)}`;
   }
 
   function updateCurl() {

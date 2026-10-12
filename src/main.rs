@@ -1210,6 +1210,22 @@ mod tests {
         assert_eq!(response_body(&head), "0123");
         let by_query = get_body(&server, &format!("{hook_url}?token=tok&limit=2"), None).await;
         assert_eq!(response_body(&by_query), "01");
+        let by_header = raw_http(
+            server.addr,
+            format!(
+                "GET {hook_url}?limit=3 HTTP/1.0\r\nhost: localhost\r\nx-stream-token: tok\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(response_body(&by_header), "012");
+        let wrong_header = raw_http(
+            server.addr,
+            format!("GET {hook_url} HTTP/1.0\r\nhost: localhost\r\nx-stream-token: nope\r\n\r\n")
+                .as_bytes(),
+        )
+        .await;
+        assert!(wrong_header.contains(" 401 "), "{wrong_header}");
         let denied = get_body(&server, &hook_url, None).await;
         assert!(denied.contains(" 401 "), "{denied}");
         let unknown = get_body(&server, "/_wh_admin/stream/body/..%2F..%2Fetc", Some("tok")).await;
@@ -1275,6 +1291,19 @@ mod tests {
         )
         .await;
         assert!(denied.contains(" 401 "), "{denied}");
+
+        // X-Stream-Token works for the stream itself too.
+        let mut by_header = TcpStream::connect(server.addr).await.expect("connect");
+        by_header
+            .write_all(
+                b"GET /_wh_admin/stream HTTP/1.0\r\nhost: localhost\r\nx-stream-token: tok\r\n\r\n",
+            )
+            .await
+            .expect("request");
+        let mut head = [0u8; 64];
+        let n = by_header.read(&mut head).await.expect("read");
+        assert!(String::from_utf8_lossy(&head[..n]).contains(" 200 "));
+        drop(by_header);
 
         // HTTP/1.0 keeps the never-ending body unchunked, like curl output.
         let mut client = TcpStream::connect(server.addr).await.expect("connect");
