@@ -978,11 +978,6 @@ fn stream_view(state: &AppState) -> Response {
     let prefix_js = serde_json::to_string(&prefix)
         .unwrap_or_else(|_| "\"\"".to_string())
         .replace('<', "\\u003c");
-    let token_required = if state.config.stream.token.is_some() {
-        "true"
-    } else {
-        "false"
-    };
     // The page is behind the admin login, so it can carry the stream token
     // and connect without the user typing it.
     let token_js = serde_json::to_string(state.config.stream.token.as_deref().unwrap_or(""))
@@ -990,7 +985,6 @@ fn stream_view(state: &AppState) -> Response {
         .replace('<', "\\u003c");
     let body = STREAM_VIEW
         .replace("__ADMIN_PREFIX__", &prefix_js)
-        .replace("__TOKEN_REQUIRED__", token_required)
         .replace("__STREAM_TOKEN__", &token_js);
     page(
         state,

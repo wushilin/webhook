@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         FromRequestParts, Request,
@@ -18,6 +18,8 @@ use tracing::{info, warn};
 use crate::{admin, config, models::RequestMeta, AppState};
 
 const QUEUE_NAME: &str = "requests";
+/// An idle NDJSON stream sends a blank line this often so proxies keep it open.
+const NDJSON_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// One captured request, serialized once and shared by every consumer.
 #[derive(Clone)]
@@ -107,16 +109,58 @@ pub async fn handle(state: AppState, req: Request<Body>) -> Response {
         return (StatusCode::UNAUTHORIZED, "invalid stream token\n").into_response();
     }
     let prefix = admin::form_value(&query, "prefix").and_then(|p| normalize_prefix(&p));
+    let websocket = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
+    let Some(rx) = state.stream.subscribe() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "stream is shutting down\n").into_response();
+    };
+    if !websocket {
+        return ndjson(rx, prefix);
+    }
     let (mut parts, _body) = req.into_parts();
     let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
         Ok(ws) => ws,
         Err(rejection) => return rejection.into_response(),
     };
-    let Some(rx) = state.stream.subscribe() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "stream is shutting down\n").into_response();
-    };
     ws.on_upgrade(move |socket| consume(socket, rx, prefix))
+}
+
+/// The same events as plain HTTP for curl and friends: a never-ending
+/// response with one JSON envelope per line. The subscription ends when the
+/// client disconnects (the body stream is dropped) or the server shuts down.
+fn ndjson(rx: Receiver<StreamEvent>, prefix: Option<String>) -> Response {
+    let lines = futures_util::stream::unfold((rx, prefix), |(rx, prefix)| async move {
+        loop {
+            match tokio::time::timeout(NDJSON_HEARTBEAT, rx.recv_async()).await {
+                Err(_) => {
+                    return Some((Ok::<_, Infallible>(Bytes::from_static(b"\n")), (rx, prefix)))
+                }
+                Ok(Err(_)) => return None,
+                Ok(Ok(event)) => {
+                    if prefix
+                        .as_deref()
+                        .is_some_and(|p| !event.path.starts_with(p))
+                    {
+                        continue;
+                    }
+                    let mut line = event.json.as_bytes().to_vec();
+                    line.push(b'\n');
+                    return Some((Ok(Bytes::from(line)), (rx, prefix)));
+                }
+            }
+        }
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(header::CACHE_CONTROL, "no-store")
+        // Ask buffering reverse proxies (nginx) to pass lines through as they come.
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(lines))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// `GET <admin_prefix>/stream/body/<id>`, authorised by the stream token.

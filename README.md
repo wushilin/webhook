@@ -284,7 +284,7 @@ Request ids start with the UTC capture time (`20261012T082031.922460000Z_<host>_
 }
 ```
 
-Creating a body file is retried as a whole: create the folder, touch it (update its modification time), create the file; if any step fails, for example because cleanup removed the folder in between, all three are repeated, up to 5 times. The body is then written as a stream and the metadata is committed once it is complete. If a client disconnects mid-body or an unknown-length body crosses `max_body_size`, the metadata records `complete = false` (and `limit_exceeded = true` in the latter case).
+Creating a body file is retried as a whole: create the folder, touch it (update its modification time), create the file; if any step fails, for example because cleanup removed the folder in between, all three are repeated, up to 5 times. The file is only created when the first byte of body arrives, so a request with an empty body (most `GET`s) writes no file at all and its metadata has `stored: false`. The body is written as a stream and the metadata is committed once it is complete. If a client disconnects mid-body or an unknown-length body crosses `max_body_size`, the metadata records `complete = false` (and `limit_exceeded = true` in the latter case).
 
 ## Large bodies
 
@@ -316,7 +316,7 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 | `/_wh_admin/requests/<id>/body` | The stored body, behind the admin login (same responses as the stream body endpoint below) |
 | `/_wh_admin/login`, `/logout` | Session login/logout (only when `admin.password` is set) |
 | `/_wh_admin/stream` | WebSocket stream of captured requests (see below) |
-| `/_wh_admin/streamview` | Live browser view of the stream, with the stream token pre-filled (see below) |
+| `/_wh_admin/streamview` | Live browser view of the stream; connects with the configured token, no input needed (see below) |
 
 Paths that merely resemble the admin prefix (e.g. `/_wh_adminfoo`) are still captured as webhooks.
 
@@ -332,6 +332,16 @@ Add `?prefix=/api/v1` to receive only requests whose path starts with `/api/v1`.
 websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/stream?prefix=/api/v1'
 ```
 
+### Plain HTTP (curl)
+
+The same endpoint also serves clients that don't speak WebSocket. A plain `GET` (no `Upgrade: websocket` header) gets a never-ending `application/x-ndjson` response: one envelope per line, in the same format as the WebSocket messages, with the same token and `?prefix=` rules. While idle it sends a blank line every 30 seconds so proxies don't close the connection.
+
+```sh
+curl -sN 'https://example.com/_wh_admin/stream?token=change-me&prefix=/api/v1' | jq .
+```
+
+The live view page shows this command, with your token and current prefix filled in, in a code block with a *Copy* button.
+
 ### Live view
 
 `/_wh_admin/streamview` shows the stream in the browser. Enter the stream token and an optional path prefix, and new requests appear on top as cards. Click a card to expand it and see:
@@ -342,9 +352,9 @@ websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/str
 
 **Pause** only freezes the page. The WebSocket stays connected, and new requests wait in a banner until you resume. The page keeps the latest 500 cards and drops the oldest. It reconnects automatically if the connection drops.
 
-The page is behind the admin login like the rest of the UI. It is served with the configured `stream.token` already filled in, so it connects as soon as it opens; you can still read the token from the (masked) field to use in other clients. `?prefix=…` prefills the path filter, and the page remembers the last prefix in the browser's local storage.
+The page is behind the admin login like the rest of the UI. It is served with the configured `stream.token` built in, so there is nothing to enter: it connects as soon as it opens. `?prefix=…` prefills the path filter, and the page remembers the last prefix in the browser's local storage.
 
-Only the `/stream` WebSocket and its body endpoint are reachable without logging in, and both require `stream.token`.
+Only the `/stream` endpoint (WebSocket or NDJSON) and its body endpoint are reachable without logging in, and both require `stream.token`.
 
 ### Message format
 
@@ -364,7 +374,7 @@ Message fields:
 | `query` | string \| null | Raw query string without the `?` |
 | `headers` | object | Header name (lowercase) → string, or an array of strings when the header repeats |
 | `body` | object | Stored body metadata, the same as in the metadata JSON on disk: `stored`, `complete`, `mode`, `object`, `encoding`, `original_size` (bytes received), `stored_size` (bytes on disk), `content_type`, `previewable`, `limit_exceeded`, `error` |
-| `body_url` | string \| null | Path of the body endpoint for this request. `null` when no body file was written, for example in `metadata_only` mode or when the request was rejected up front by `Content-Length` |
+| `body_url` | string \| null | Path of the body endpoint for this request. `null` when no body file was written: an empty body, `metadata_only` mode, or a request rejected up front by `Content-Length` |
 
 Example (formatted here for readability; on the wire it is a single line):
 
@@ -414,8 +424,8 @@ The admin UI's stylesheet and scripts live in `src/ui/` and are compiled into th
 To cut a release, bump `version` in `Cargo.toml`, commit, then push a tag:
 
 ```sh
-git tag -a v0.2.1 -m "webhook 0.2.1"
-git push origin v0.2.1
+git tag -a v0.2.2 -m "webhook 0.2.2"
+git push origin v0.2.2
 ```
 
 ## License

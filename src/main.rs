@@ -460,33 +460,9 @@ async fn stream_body(
         };
     };
 
-    let file = match storage.create_body_file(location).await {
-        Ok(file) => file,
-        Err(err) => {
-            return BodyMeta {
-                stored: false,
-                complete: false,
-                mode: rule.body_mode.to_string(),
-                object: Some(location.object.clone()),
-                encoding: rule.body_mode.encoding().map(ToString::to_string),
-                original_size: 0,
-                stored_size: 0,
-                content_type: content_type(headers),
-                previewable: false,
-                limit_exceeded: false,
-                error: Some(format!("failed to create body file: {err}")),
-            };
-        }
-    };
-
-    let mut writer: Box<dyn AsyncWrite + Unpin + Send> = match rule.body_mode {
-        config::BodyMode::Compressed => {
-            Box::new(async_compression::tokio::write::GzipEncoder::new(file))
-        }
-        config::BodyMode::Raw => Box::new(file),
-        config::BodyMode::MetadataOnly => unreachable!(),
-    };
-
+    // The body file is created with the first non-empty chunk, so a request
+    // without a body leaves no file behind.
+    let mut writer: Option<Box<dyn AsyncWrite + Unpin + Send>> = None;
     let mut stream = body.into_data_stream();
     let mut original_size = 0u64;
     let mut complete = true;
@@ -506,7 +482,28 @@ async fn stream_body(
                     ));
                     break;
                 }
-                if let Err(err) = writer.write_all(&bytes).await {
+                if bytes.is_empty() {
+                    continue;
+                }
+                if writer.is_none() {
+                    match storage.create_body_file(location).await {
+                        Ok(file) => {
+                            writer = Some(match rule.body_mode {
+                                config::BodyMode::Compressed => Box::new(
+                                    async_compression::tokio::write::GzipEncoder::new(file),
+                                ),
+                                _ => Box::new(file),
+                            })
+                        }
+                        Err(err) => {
+                            complete = false;
+                            error = Some(format!("failed to create body file: {err}"));
+                            break;
+                        }
+                    }
+                }
+                let Some(out) = writer.as_mut() else { break };
+                if let Err(err) = out.write_all(&bytes).await {
                     complete = false;
                     error = Some(format!("body write failed: {err}"));
                     break;
@@ -519,6 +516,22 @@ async fn stream_body(
             }
         }
     }
+
+    let Some(mut writer) = writer else {
+        return BodyMeta {
+            stored: false,
+            complete,
+            mode: rule.body_mode.to_string(),
+            object: None,
+            encoding: None,
+            original_size,
+            stored_size: 0,
+            content_type: content_type(headers),
+            previewable: false,
+            limit_exceeded,
+            error,
+        };
+    };
 
     if let Err(err) = writer.shutdown().await {
         complete = false;
@@ -1247,8 +1260,101 @@ mod tests {
             page.contains(r#"const ADMIN_PREFIX = "/_wh_admin";"#),
             "{page}"
         );
-        assert!(page.contains("const TOKEN_REQUIRED = true;"), "{page}");
         assert!(!page.contains("__ADMIN_PREFIX__"));
+    }
+
+    #[tokio::test]
+    async fn stream_serves_ndjson_lines_to_plain_http_clients() {
+        let server = spawn_test_server_with_config(1024, |config| {
+            config.stream.token = Some("tok".to_string());
+        })
+        .await;
+        let denied = raw_http(
+            server.addr,
+            b"GET /_wh_admin/stream HTTP/1.0\r\nhost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(denied.contains(" 401 "), "{denied}");
+
+        // HTTP/1.0 keeps the never-ending body unchunked, like curl output.
+        let mut client = TcpStream::connect(server.addr).await.expect("connect");
+        client
+            .write_all(
+                b"GET /_wh_admin/stream?token=tok&prefix=/keep HTTP/1.0\r\nhost: localhost\r\n\r\n",
+            )
+            .await
+            .expect("request");
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        // Wait for the headers so the subscription exists before capturing.
+        while !String::from_utf8_lossy(&received).contains("\r\n\r\n") {
+            let n = client.read(&mut buf).await.expect("read");
+            received.extend_from_slice(&buf[..n]);
+        }
+        let head = String::from_utf8_lossy(&received).into_owned();
+        assert!(head.contains("application/x-ndjson"), "{head}");
+
+        raw_http(
+            server.addr,
+            b"POST /skip HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        raw_http(
+            server.addr,
+            b"POST /keep/one HTTP/1.1\r\nhost: localhost\r\ncontent-length: 2\r\nconnection: close\r\n\r\nhi",
+        )
+        .await;
+        let line = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let text = String::from_utf8_lossy(&received).into_owned();
+                if let Some(body) = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()) {
+                    if let Some(line) = body.lines().find(|l| !l.trim().is_empty()) {
+                        if body.contains('\n') {
+                            return line.to_string();
+                        }
+                    }
+                }
+                let n = client.read(&mut buf).await.expect("read");
+                received.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("ndjson line");
+        let event: serde_json::Value = serde_json::from_str(&line).expect("json line");
+        assert_eq!(event["path"], "/keep/one");
+        assert!(event["body_url"].is_string());
+    }
+
+    #[tokio::test]
+    async fn empty_bodies_leave_no_body_file() {
+        let server = spawn_test_server(1024).await;
+        raw_http(
+            server.addr,
+            b"GET /empty HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        raw_http(
+            server.addr,
+            b"POST /full HTTP/1.1\r\nhost: localhost\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc",
+        )
+        .await;
+        let records = wait_for_records(&server, 2).await;
+        let empty = records.iter().find(|m| m.path == "/empty").expect("empty");
+        assert!(!empty.body.stored);
+        assert!(empty.body.complete);
+        assert!(empty.body.object.is_none());
+        assert!(server.state.storage.blob_path(empty).is_none());
+
+        let full = records.iter().find(|m| m.path == "/full").expect("full");
+        let blob = server.state.storage.blob_path(full).expect("blob");
+        assert!(blob.exists());
+        // Only the non-empty request produced a file.
+        let blob_dir = blob.parent().unwrap().parent().unwrap();
+        let files: usize = std::fs::read_dir(blob_dir)
+            .unwrap()
+            .map(|d| std::fs::read_dir(d.unwrap().path()).unwrap().count())
+            .sum();
+        assert_eq!(files, 1);
     }
 
     #[tokio::test]
