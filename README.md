@@ -312,7 +312,7 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 |---|---|
 | `/_wh_admin/` | Overview for the last 1 hour, 24 hours, 7 days or 30 days: requests, complete, incomplete, limit exceeded and body bytes, a requests-over-time chart (hover a column for its numbers, or *Show as table*), the method breakdown, and stored totals. Built from the counts buckets: at most 1,440 minute or 720 hour keys per view, and the counts survive restarts |
 | `/_wh_admin/requests` | Request explorer. Searches **everything retained**, newest first, by path prefix (`?path=`, a plain string prefix) and time range (quick ranges or a custom from/to in the server's time zone), 100 per page with an *Older* link. If a rare prefix doesn't fill a page within the scan budget, the page says how far back it searched and offers to keep going |
-| `/_wh_admin/requests/<id>` | Request detail: status, sizes, and Body / Headers / Query / Raw tabs. The body loads on demand — the first 256KiB, then *Load all* (*Load first 5 MiB* for larger bodies; the page never holds more than 5MiB) — and is shown as formatted JSON, form fields, text or a hex dump. *Download* saves the whole body of any size straight to disk. *Copy as cURL* rebuilds the request |
+| `/_wh_admin/requests/<id>` | Request detail: status, sizes, and Body / Headers / Query / Raw tabs. The body loads on demand — the first 256KiB, then *Load all* (*Load first 5 MiB* for larger bodies; the page never holds more than 5MiB) — and is shown as formatted JSON, form fields, text or a hex dump. *Download* saves the whole body of any size straight to disk, and a copyable curl command fetches it through the stream API with the token. *Copy as cURL* rebuilds the request |
 | `/_wh_admin/requests/<id>/body` | The stored body, behind the admin login (same responses as the stream body endpoint below) |
 | `/_wh_admin/login`, `/logout` | Session login/logout (only when `admin.password` is set) |
 | `/_wh_admin/stream` | WebSocket stream of captured requests (see below) |
@@ -340,7 +340,7 @@ The same endpoint also serves clients that don't speak WebSocket. A plain `GET` 
 curl -sN -H 'X-Stream-Token: change-me' 'https://example.com/_wh_admin/stream?prefix=/api/v1' | jq .
 ```
 
-The live view page shows this command, with your token and current prefix filled in, in a code block with a *Copy* button.
+The live view page shows this command, and a body-fetch command, with your token and current prefix filled in, in code blocks with *Copy* buttons. Each expanded stream card and each request detail page also shows the exact command to fetch that request's body.
 
 ### Live view
 
@@ -424,8 +424,8 @@ The admin UI's stylesheet and scripts live in `src/ui/` and are compiled into th
 To cut a release, bump `version` in `Cargo.toml`, commit, then push a tag:
 
 ```sh
-git tag -a v0.2.3 -m "webhook 0.2.3"
-git push origin v0.2.3
+git tag -a v0.2.4 -m "webhook 0.2.4"
+git push origin v0.2.4
 ```
 
 ## License

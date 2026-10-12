@@ -266,6 +266,28 @@
     return "'" + String(s).replace(/'/g, "'\\''") + "'";
   }
 
+  /** curl for a stored body over the token-protected stream API. */
+  function bodyCurl(streamBodyPath, token) {
+    const auth = token ? ` -H ${shellQuote("X-Stream-Token: " + token)}` : "";
+    return `curl -s${auth} ${shellQuote(location.origin + streamBodyPath)}`;
+  }
+
+  /** A labelled, copyable command. `code` is returned for later updates. */
+  function codeBlock(label, text) {
+    const wrap = el("div", "codeblock");
+    const head = el("div", "codeblock-head");
+    const code = el("code", null, text);
+    const pre = el("pre");
+    pre.append(code);
+    head.append(
+      el("span", null, label),
+      button("Copy", "secondary small", (e) => copyText(code.textContent, e.currentTarget)),
+    );
+    wrap.append(head, pre);
+    wrap.code = code;
+    return wrap;
+  }
+
   async function curlCommand(meta, bodyUrl) {
     const headers = meta.headers || {};
     const first = (name) => {
@@ -298,7 +320,7 @@
   function initDetail() {
     const dataEl = document.getElementById("req-data");
     if (!dataEl) return;
-    const { meta, bodyUrl } = JSON.parse(dataEl.textContent);
+    const { meta, bodyUrl, streamBodyUrl, streamToken } = JSON.parse(dataEl.textContent);
 
     const tabs = document.querySelectorAll(".tabs [data-tab]");
     const select = (name) => {
@@ -313,7 +335,11 @@
     const initial = location.hash.slice(1);
     select([...tabs].some((t) => t.dataset.tab === initial) ? initial : "body");
 
-    bodyViewer(document.getElementById("tab-body"), meta, bodyUrl);
+    const bodyTab = document.getElementById("tab-body");
+    bodyViewer(bodyTab, meta, bodyUrl);
+    if (streamBodyUrl) {
+      bodyTab.append(codeBlock("Fetch this body from a terminal", bodyCurl(streamBodyUrl, streamToken)));
+    }
 
     const curl = document.getElementById("copy-curl");
     if (curl) {
@@ -369,6 +395,7 @@
 
   window.WH = {
     el, button, humanBytes, fmtTime, methodChip, statusPill, bodyViewer, headersTable, copyText,
+    codeBlock, bodyCurl,
   };
   document.addEventListener("DOMContentLoaded", () => {
     initDetail();

@@ -848,7 +848,17 @@ async fn request_detail(state: AppState, id: &str) -> Response {
         .storage
         .blob_path(&meta)
         .map(|_| format!("{prefix}/requests/{}/body", urlencoding::encode(&meta.id)));
-    let data = serde_json::json!({ "meta": &meta, "bodyUrl": body_url });
+    // The page is behind the admin login, so it can show the stream token in
+    // its copyable curl command.
+    let stream_body_url = body_url
+        .as_ref()
+        .map(|_| format!("{prefix}/stream/body/{}", urlencoding::encode(&meta.id)));
+    let data = serde_json::json!({
+        "meta": &meta,
+        "bodyUrl": body_url,
+        "streamBodyUrl": stream_body_url,
+        "streamToken": state.config.stream.token.as_deref().unwrap_or(""),
+    });
     // JSON inside <script>: escape `<` so the data can never close the tag.
     let data = data.to_string().replace('<', "\\u003c");
 

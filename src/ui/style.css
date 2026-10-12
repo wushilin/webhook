@@ -303,7 +303,12 @@ pre {
   margin-bottom: 12px; padding: 10px 14px; border-radius: 10px;
   background: var(--warn-bg); color: var(--warn-ink); font-size: 14px; font-weight: 600; box-shadow: var(--shadow-lift);
 }
+.codeblock { margin: 12px 0 0; }
+.codeblock:first-child { margin-top: 0; }
+.codeblock-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.codeblock pre { margin: 0; max-height: none; }
 .sv-curl { margin-bottom: 16px; }
+.sv-curl > p { margin-top: 10px; }
 .sv-curl pre { margin: 0 0 8px; max-height: none; }
 .sv-curl p { margin: 0; font-size: 13px; }
 .sv-curl p code { font-family: var(--mono); font-size: 12px; background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }

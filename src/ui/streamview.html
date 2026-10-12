@@ -17,12 +17,9 @@
   </div>
 </section>
 <section class="card sv-curl">
-  <div class="card-head">
-    <h2>Stream from a terminal</h2>
-    <button id="sv-curl-copy" type="button" class="secondary small">Copy</button>
-  </div>
-  <pre><code id="sv-curl"></code></pre>
-  <p class="muted">One JSON envelope per line, for as long as curl runs. Pipe it into <code>jq</code>, and fetch a body with its <code>body_url</code> and the same token.</p>
+  <div class="card-head"><h2>Use from a terminal</h2></div>
+  <div id="sv-curl-blocks"></div>
+  <p class="muted">The stream prints one JSON envelope per line for as long as curl runs; pipe it into <code>jq</code>. Each envelope's <code>body_url</code> is the path for the body fetch, which takes <code>?limit=N</code> for just the first N bytes.</p>
 </section>
 <div id="sv-banner" class="sv-banner" hidden>
   <span id="sv-banner-text"></span>
@@ -49,7 +46,7 @@
     pause: $("sv-pause"), collapse: $("sv-collapse"), clear: $("sv-clear"),
     banner: $("sv-banner"), bannerText: $("sv-banner-text"), resume: $("sv-resume"),
     empty: $("sv-empty"), list: $("sv-list"),
-    curl: $("sv-curl"), curlCopy: $("sv-curl-copy"),
+    curlBlocks: $("sv-curl-blocks"),
   };
 
   const storage = {
@@ -84,8 +81,15 @@
     return `curl -sN${auth} ${quote(url)}`;
   }
 
+  const streamBlock = window.WH.codeBlock("Stream requests", "");
+  const bodyBlock = window.WH.codeBlock(
+    "Fetch a body (replace <id> with a request id)",
+    window.WH.bodyCurl(ADMIN_PREFIX + "/stream/body/<id>", STREAM_TOKEN),
+  );
+  els.curlBlocks.append(streamBlock, bodyBlock);
+
   function updateCurl() {
-    els.curl.textContent = curlCommand();
+    streamBlock.code.textContent = curlCommand();
   }
 
   function streamUrl() {
@@ -299,7 +303,11 @@
     };
     const viewer = el("div");
     bodyViewer(viewer, ev, ev.body_url, activeToken);
-    detail.append(section("Body", viewer), section("Headers", headersTable(ev.headers)));
+    detail.append(section("Body", viewer));
+    if (ev.body_url) {
+      detail.append(section("Fetch from a terminal", window.WH.codeBlock("This body", window.WH.bodyCurl(ev.body_url, STREAM_TOKEN))));
+    }
+    detail.append(section("Headers", headersTable(ev.headers)));
     return detail;
   }
 
@@ -330,8 +338,6 @@
     updateBanner();
     updateCounts();
   });
-
-  els.curlCopy.addEventListener("click", () => window.WH.copyText(curlCommand(), els.curlCopy));
 
   updateCurl();
   updateCounts();
