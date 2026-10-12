@@ -65,7 +65,7 @@ pub fn password_matches(stored: &str, given: &str) -> bool {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -98,6 +98,8 @@ pub async fn handle_admin(state: AppState, req: Request<Body>) -> Response {
         }
         "/login" if method == Method::POST => login_submit(state, req).await,
         "/logout" => logout(&state, req.headers()),
+        // Authenticated by stream.token rather than the admin session.
+        "/stream" => crate::stream::handle(state, req).await,
         _ if !is_authorized(&state, req.headers()) => redirect(&format!("{prefix}/login")),
         "" | "/" => dashboard(state).await,
         "/requests" => requests(state, req.uri().query()).await,
@@ -209,7 +211,7 @@ fn redirect(location: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::SEE_OTHER.into_response())
 }
 
-fn parse_form(body: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_form(body: &str) -> Vec<(String, String)> {
     body.split('&')
         .filter_map(|pair| {
             let (key, value) = pair.split_once('=')?;
@@ -218,7 +220,7 @@ fn parse_form(body: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn form_value(form: &[(String, String)], name: &str) -> Option<String> {
+pub(crate) fn form_value(form: &[(String, String)], name: &str) -> Option<String> {
     form.iter()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.clone())

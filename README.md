@@ -118,6 +118,11 @@ mode = "compressed"            # compressed | raw | metadata_only
 preview_limit = "5MiB"         # max original body size shown in the admin UI preview
 max_body_size = "100MiB"       # requests with a larger body are rejected with 413
 
+[stream]
+token = "change-me"            # required by the websocket stream; unset = open stream
+buffer = 1024                  # events buffered per consumer before its oldest are dropped
+max_body_size = "5MiB"         # longer bodies are cut to this size and flagged truncated
+
 # Default response for successful captures
 [responder]
 status = 200
@@ -167,6 +172,14 @@ Durations use [humantime](https://docs.rs/humantime) syntax (`30d`, `1h`, `15m`,
 |---|---|---|
 | `username` | `admin` | Admin login username |
 | `password` | *(unset)* | bcrypt hash (recommended) or plaintext. When unset, the admin UI is **open** and a warning is logged at startup |
+
+### `[stream]`
+
+| Key | Default | Description |
+|---|---|---|
+| `token` | *(unset)* | Token required to open the request stream. When unset, the stream is **open** to anyone and a warning is logged at startup |
+| `buffer` | `1024` | Events buffered per consumer. A consumer that falls further behind loses its oldest events |
+| `max_body_size` | `5MiB` | At most this many body bytes are included in each stream event; a longer body is cut off and flagged with `body_truncated` |
 
 Sessions and the recent-request browser are kept in memory — restarting the server signs everyone out and starts a new recent-request view.
 
@@ -282,8 +295,75 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 | `/_wh_admin/requests` | Last 5000 requests since process start, filterable by path |
 | `/_wh_admin/requests/<id>` | Request detail with headers and body preview for requests still in the recent-request buffer |
 | `/_wh_admin/login`, `/logout` | Session login/logout (only when `admin.password` is set) |
+| `/_wh_admin/stream` | WebSocket stream of captured requests (see below) |
 
 Paths that merely resemble the admin prefix (e.g. `/_wh_adminfoo`) are still captured as webhooks.
+
+## Request stream
+
+`/_wh_admin/stream` is a WebSocket that pushes one JSON text message for each request captured after you connect. It uses `stream.token` rather than the admin login, sent as `Authorization: Bearer <token>` or `?token=<token>`. If `stream.token` is unset, the stream needs no token.
+
+Every connection is an independent consumer that receives its own copy of every event. A slow consumer never holds up the others or the capture path. If a consumer falls more than `stream.buffer` events behind, it loses its oldest events. Events from before you connect are not replayed.
+
+Add `?prefix=/api/v1` to receive only requests whose path is `/api/v1` or is under `/api/v1/`, using the same matching as `[[paths]]` rules.
+
+```sh
+websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/stream?prefix=/api/v1'
+```
+
+### Message format
+
+- **One request, one message.** Each captured request is sent as exactly one WebSocket **text** message containing one UTF-8 JSON object. A request is never split across messages, and a message never holds more than one request. No other message types are sent.
+- **Ordering.** Messages arrive in the order the requests finished being captured. A message is sent only after that request's body file and metadata JSON have been written.
+- **Size.** A message can be up to about 4/3 × `stream.max_body_size` plus the metadata, because the body is base64-encoded. That is roughly 7MiB with the default 5MiB limit, so make sure your client accepts messages that large.
+- **Client to server.** Anything the client sends is ignored, apart from Close. Pings are answered automatically.
+- **Shutdown.** When the server shuts down, it sends a Close frame.
+- **All body modes.** Requests are streamed in every `body.mode`, including `metadata_only`.
+
+Message fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Capture id, the same one used in the admin UI and in the capture response |
+| `received_at` | string | RFC 3339 timestamp with the server's local offset |
+| `method` | string | HTTP method |
+| `path` | string | Request path, still percent-encoded as received |
+| `query` | string \| null | Raw query string without the `?` |
+| `headers` | object | Header name (lowercase) → string, or an array of strings when the header repeats |
+| `body` | object | Stored body metadata, the same as in the metadata JSON on disk: `stored`, `complete`, `mode`, `object`, `encoding`, `original_size`, `stored_size`, `content_type`, `previewable`, `limit_exceeded`, `error` |
+| `body_base64` | string \| null | Standard base64 (with padding) of the original, uncompressed body, at most `stream.max_body_size` bytes of it. An empty body is `""`. `null` only when no bytes were captured |
+| `body_truncated` | bool | `true` when `body_base64` is not the whole body |
+| `body_truncated_reason` | string \| null | Why the body was truncated (see below), or `null` |
+
+Truncation reasons:
+
+- `"body too big for streaming"`: the body is larger than `stream.max_body_size`, so only its first `stream.max_body_size` bytes are sent. `body.original_size` has the full size.
+- `"body exceeded max_body_size"`: the request went over the capture limit and got a 413. You get the bytes received before the cutoff, or `null` if it was rejected up front by `Content-Length`.
+- `"body incomplete"`: the client disconnected mid-body. You get the bytes that arrived.
+- `"body not captured"`: you connected while that request was still arriving, so `body_base64` is `null`.
+
+Example (formatted here for readability; on the wire it is a single line):
+
+```json
+{
+  "id": "07_123456789_myhost_AbCdEfGhIjKlMnOp",
+  "received_at": "2026-10-12T09:15:07.123456789+08:00",
+  "method": "POST",
+  "path": "/api/v1/hook",
+  "query": "source=github",
+  "headers": { "content-type": "application/json", "content-length": "11" },
+  "body": {
+    "stored": true, "complete": true, "mode": "compressed",
+    "object": "07_123456789_myhost_AbCdEfGhIjKlMnOp.body.bin.gz",
+    "encoding": "gzip", "original_size": 11, "stored_size": 31,
+    "content_type": "application/json", "previewable": true,
+    "limit_exceeded": false, "error": null
+  },
+  "body_base64": "eyJoZWxsbyI6MX0=",
+  "body_truncated": false,
+  "body_truncated_reason": null
+}
+```
 
 ## Development
 

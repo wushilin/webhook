@@ -30,6 +30,13 @@ status = 200
 body = "metadata_json" # metadata_json | { static_text = "ok" } | { static_json = { success = true } }
 headers = { content-type = "application/json; charset=utf-8" }
 
+[stream]
+# Required by the <admin_prefix>/stream websocket (Bearer header or ?token=).
+# When unset, anyone can open the stream.
+token = "changeme-stream"
+buffer = 1024
+max_body_size = "5MiB"
+
 [[responders]]
 match = "/api1"
 status = 200

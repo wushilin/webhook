@@ -21,6 +21,27 @@ pub struct Config {
     pub paths: Vec<PathRule>,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub stream: StreamConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamConfig {
+    /// Token required to open the `<admin_prefix>/stream` websocket. When
+    /// absent, anyone can open the stream.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Events buffered per consumer; a consumer lagging further behind loses
+    /// its oldest events.
+    #[serde(default = "default_stream_buffer")]
+    pub buffer: usize,
+    /// At most this many body bytes are included in a stream event; longer
+    /// bodies are cut off and flagged as truncated.
+    #[serde(
+        default = "default_stream_max_body_size",
+        deserialize_with = "deserialize_size"
+    )]
+    pub max_body_size: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -212,6 +233,17 @@ impl Config {
                 bail!("path rule match must start with /: {}", rule.path_match);
             }
         }
+        if self
+            .stream
+            .token
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            bail!("stream.token must not be empty; remove it to leave the stream open");
+        }
+        if self.stream.buffer == 0 {
+            bail!("stream.buffer must be at least 1");
+        }
         validate_status(self.responder.status)?;
         for name in self.responder.headers.keys() {
             validate_header_name(name)?;
@@ -317,6 +349,14 @@ max_body_size = "100MiB"
 status = 200
 body = "metadata_json" # metadata_json | { static_text = "ok" } | { static_json = { success = true } }
 headers = { content-type = "application/json; charset=utf-8" }
+
+[stream]
+# Token for the <admin_prefix>/stream websocket, passed as
+# `Authorization: Bearer <token>` or `?token=<token>`.
+# When unset, anyone can open the stream.
+# token = "..."
+buffer = 1024 # events buffered per consumer before its oldest are dropped
+max_body_size = "5MiB" # longer bodies are cut to this size and flagged truncated
 "#
 }
 
@@ -325,6 +365,16 @@ impl Default for AdminConfig {
         Self {
             username: default_admin_username(),
             password: None,
+        }
+    }
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            token: None,
+            buffer: default_stream_buffer(),
+            max_body_size: default_stream_max_body_size(),
         }
     }
 }
@@ -427,6 +477,14 @@ fn default_max_body_size() -> u64 {
     100 * 1024 * 1024
 }
 
+fn default_stream_buffer() -> usize {
+    1024
+}
+
+fn default_stream_max_body_size() -> u64 {
+    5 * 1024 * 1024
+}
+
 fn default_response_status() -> u16 {
     200
 }
@@ -448,7 +506,7 @@ fn valid_admin_prefix(prefix: &str) -> bool {
     prefix.starts_with("/_") && prefix.len() >= 7 && prefix.ends_with("admin")
 }
 
-fn path_matches(path: &str, rule: &str) -> bool {
+pub fn path_matches(path: &str, rule: &str) -> bool {
     path == rule || path.starts_with(&format!("{}/", rule.trim_end_matches('/')))
 }
 
@@ -568,5 +626,8 @@ admin_prefix = "/_custom_admin///"
         assert!(matches!(parsed.responder.body, ResponderBody::MetadataJson));
         assert!(parsed.responders.is_empty());
         assert!(parsed.paths.is_empty());
+        assert_eq!(parsed.stream.token, default.stream.token);
+        assert_eq!(parsed.stream.buffer, default.stream.buffer);
+        assert_eq!(parsed.stream.max_body_size, default.stream.max_body_size);
     }
 }
