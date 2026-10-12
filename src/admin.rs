@@ -18,6 +18,7 @@ use crate::{models::RequestMeta, storage::RequestRecord, AppState};
 const SESSION_COOKIE: &str = "wh_admin_session";
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOGIN_FORM_LIMIT: usize = 16 * 1024;
+const STREAM_VIEW: &str = include_str!("streamview.html");
 
 #[derive(Debug, Default)]
 pub struct Sessions {
@@ -100,6 +101,8 @@ pub async fn handle_admin(state: AppState, req: Request<Body>) -> Response {
         "/logout" => logout(&state, req.headers()),
         // Authenticated by stream.token rather than the admin session.
         "/stream" => crate::stream::handle(state, req).await,
+        // A static shell: every event it shows comes through the token-gated stream.
+        "/streamview" => stream_view(&state),
         _ if !is_authorized(&state, req.headers()) => redirect(&format!("{prefix}/login")),
         "" | "/" => dashboard(state).await,
         "/requests" => requests(state, req.uri().query()).await,
@@ -481,6 +484,23 @@ fn body_status(meta: &RequestMeta) -> String {
     }
 }
 
+fn stream_view(state: &AppState) -> Response {
+    let prefix = state.config.server.admin_prefix.trim_end_matches('/');
+    // JSON string literal, with `<` escaped so it cannot close the script tag.
+    let prefix_js = serde_json::to_string(prefix)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c");
+    let token_required = if state.config.stream.token.is_some() {
+        "true"
+    } else {
+        "false"
+    };
+    let body = STREAM_VIEW
+        .replace("__ADMIN_PREFIX__", &prefix_js)
+        .replace("__TOKEN_REQUIRED__", token_required);
+    page(state, "Live stream", "stream", &body)
+}
+
 fn login_page(state: &AppState, error: Option<&str>, status: StatusCode) -> Response {
     let prefix = state.config.server.admin_prefix.trim_end_matches('/');
     let error_html = error
@@ -544,6 +564,7 @@ fn page(state: &AppState, title: &str, active: &str, body: &str) -> Response {
     <nav>
       <a href="{prefix}/"{dash_active}>Dashboard</a>
       <a href="{prefix}/requests"{req_active}>Requests</a>
+      <a href="{prefix}/streamview"{stream_active}>Live stream</a>
     </nav>
     <div class="side-footer">
       <small>{root}</small>
@@ -560,6 +581,7 @@ fn page(state: &AppState, title: &str, active: &str, body: &str) -> Response {
         prefix = prefix,
         dash_active = nav_class("dashboard"),
         req_active = nav_class("requests"),
+        stream_active = nav_class("stream"),
         root = escape(&state.storage.root().display().to_string()),
         logout = logout,
         body = body
@@ -729,6 +751,109 @@ pre {
   padding: 10px 12px; font-size: 13px; font-weight: 600;
 }
 
+button.secondary {
+  background: #f0efec; color: var(--ink); border: 1px solid var(--hairline); font-weight: 600;
+}
+button.secondary:hover { background: #e7e6e1; }
+
+.sv-toolbar { display: grid; gap: 14px; margin-bottom: 16px; }
+.sv-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.sv-form label {
+  display: grid; gap: 6px; flex: 1 1 220px;
+  font-size: 12px; font-weight: 650; color: var(--ink-2);
+}
+.sv-form input { min-width: 0; width: 100%; }
+.sv-form-actions { display: flex; gap: 8px; }
+.sv-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.sv-counts { margin-right: auto; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.sv-status {
+  display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 999px;
+  font-size: 13px; background: #f0efec; color: var(--ink-2);
+}
+.sv-status b { font-weight: 650; }
+.sv-status i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.sv-status.live { background: var(--good-bg); color: var(--good-ink); }
+.sv-status.live i { background: #1f9d3a; animation: sv-pulse 1.6s infinite; }
+.sv-status.paused { background: var(--warn-bg); color: var(--warn-ink); }
+.sv-status.paused i { background: #c98a00; }
+.sv-status.connecting { background: #e7f0fb; color: var(--accent-deep); }
+.sv-status.connecting i { background: var(--accent); }
+.sv-status.error { background: var(--bad-bg); color: var(--bad-ink); }
+.sv-status.error i { background: #d03b3b; }
+@keyframes sv-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(31, 157, 58, 0.5); }
+  70% { box-shadow: 0 0 0 7px rgba(31, 157, 58, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(31, 157, 58, 0); }
+}
+.sv-banner {
+  position: sticky; top: 8px; z-index: 2;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-bottom: 12px; padding: 10px 14px; border-radius: 10px;
+  background: var(--warn-bg); color: var(--warn-ink); font-size: 14px; font-weight: 600;
+  box-shadow: 0 4px 14px rgba(11, 11, 11, 0.08);
+}
+.sv-banner[hidden], .sv-empty[hidden] { display: none; }
+.sv-empty {
+  padding: 40px 20px; text-align: center; color: var(--muted);
+  border: 1px dashed var(--hairline); border-radius: 12px;
+}
+.sv-list { display: grid; gap: 10px; }
+.sv-card {
+  background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(11, 11, 11, 0.04); overflow: hidden;
+  transition: box-shadow 120ms;
+}
+.sv-card.open { box-shadow: 0 6px 18px rgba(11, 11, 11, 0.08); }
+.sv-card.fresh { animation: sv-flash 1.4s ease-out; }
+@keyframes sv-flash {
+  from { background: #eaf2fd; border-color: rgba(42, 120, 214, 0.45); }
+  to { background: var(--surface); border-color: var(--ring); }
+}
+.sv-head {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
+  align-items: center; gap: 12px; padding: 12px 16px; cursor: pointer; user-select: none;
+}
+.sv-head:hover { background: rgba(42, 120, 214, 0.045); }
+.sv-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sv-path {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sv-size, .sv-time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sv-chev { color: var(--muted); transition: transform 150ms; }
+.sv-card.open .sv-chev { transform: rotate(90deg); }
+.sv-snippet {
+  margin-top: -6px; padding: 0 16px 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: var(--ink-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sv-snippet.muted { color: var(--muted); font-style: italic; }
+.sv-card.open .sv-snippet { display: none; }
+.sv-detail { display: grid; gap: 18px; padding: 16px; border-top: 1px solid var(--hairline); }
+.sv-detail[hidden] { display: none; }
+.sv-detail .summary { margin-bottom: 0; }
+.sv-section h3 {
+  display: flex; align-items: center; gap: 8px; margin: 0 0 8px;
+  font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+}
+.sv-tools { display: flex; gap: 6px; margin-left: auto; text-transform: none; letter-spacing: 0; }
+.sv-tools button, .sv-more { padding: 4px 10px; font-size: 12px; }
+.sv-more { margin-top: 8px; }
+.sv-kind {
+  padding: 1px 7px; border-radius: 6px; background: #e7f0fb; color: var(--accent-deep);
+  letter-spacing: 0.02em;
+}
+.sv-section pre { margin: 0; max-height: 520px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.sv-note {
+  margin: 0 0 8px; padding: 8px 12px; border-radius: 8px;
+  background: var(--warn-bg); color: var(--warn-ink); font-size: 13px; font-weight: 600;
+}
+.sv-headers td { padding: 6px 10px; font-size: 13px; }
+.sv-hname { width: 30%; color: var(--ink-2); font-weight: 600; white-space: nowrap; }
+.sv-hval { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
+.sv-raw summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+.sv-raw pre { margin: 8px 0 0; max-height: 420px; }
+
 @media (max-width: 900px) {
   body { grid-template-columns: 1fr; }
   aside { flex-direction: row; align-items: center; gap: 14px; padding: 14px 16px; }
@@ -741,6 +866,8 @@ pre {
 }
 @media (max-width: 560px) {
   .metrics, .grid { grid-template-columns: 1fr; }
+  .sv-head { grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 8px; }
+  .sv-head .sv-size, .sv-head .pill { display: none; }
 }
 "#;
     (

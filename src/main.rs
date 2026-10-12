@@ -1086,6 +1086,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_view_page_is_served_with_admin_prefix() {
+        let server = spawn_test_server_with_config(1024, |config| {
+            config.admin.password = Some("secret".to_string());
+            config.stream.token = Some("tok".to_string());
+        })
+        .await;
+        let page = raw_http(
+            server.addr,
+            b"GET /_wh_admin/streamview HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        assert!(
+            page.contains(r#"const ADMIN_PREFIX = "/_wh_admin";"#),
+            "{page}"
+        );
+        assert!(page.contains("const TOKEN_REQUIRED = true;"), "{page}");
+        assert!(!page.contains("__ADMIN_PREFIX__"));
+    }
+
+    #[tokio::test]
     async fn stream_is_open_without_token() {
         let server = spawn_test_server(1024).await;
         let (mut ws, _) =

@@ -1,0 +1,535 @@
+<section class="card sv-toolbar">
+  <form id="sv-form" class="sv-form" autocomplete="off">
+    <label>Stream token
+      <input id="sv-token" type="password" spellcheck="false" placeholder="stream.token">
+    </label>
+    <label>Path prefix
+      <input id="sv-prefix" spellcheck="false" placeholder="All paths, or e.g. /api/v1">
+    </label>
+    <div class="sv-form-actions">
+      <button id="sv-connect" type="submit">Connect</button>
+      <button id="sv-disconnect" type="button" class="secondary" hidden>Disconnect</button>
+    </div>
+  </form>
+  <div class="sv-controls">
+    <span id="sv-status" class="sv-status off"><i></i><b>Disconnected</b></span>
+    <span id="sv-counts" class="sv-counts">0 received &middot; 0 shown</span>
+    <button id="sv-pause" type="button" class="secondary">Pause</button>
+    <button id="sv-collapse" type="button" class="secondary">Collapse all</button>
+    <button id="sv-clear" type="button" class="secondary">Clear</button>
+  </div>
+</section>
+<div id="sv-banner" class="sv-banner" hidden>
+  <span id="sv-banner-text"></span>
+  <button id="sv-resume" type="button">Resume</button>
+</div>
+<div id="sv-empty" class="sv-empty">
+  Connect to follow captured requests as they arrive. Newest appear on top; the latest 500 are kept.
+</div>
+<div id="sv-list" class="sv-list"></div>
+<script>
+(() => {
+  "use strict";
+  const ADMIN_PREFIX = __ADMIN_PREFIX__;
+  const TOKEN_REQUIRED = __TOKEN_REQUIRED__;
+  const MAX_CARDS = 500;
+  const SNIPPET_B64_CHARS = 400; // 300 bytes
+  const DISPLAY_LIMIT = 512 * 1024;
+  const HEXDUMP_LIMIT = 64 * 1024;
+
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    form: $("sv-form"), token: $("sv-token"), prefix: $("sv-prefix"),
+    connect: $("sv-connect"), disconnect: $("sv-disconnect"),
+    status: $("sv-status"), counts: $("sv-counts"),
+    pause: $("sv-pause"), collapse: $("sv-collapse"), clear: $("sv-clear"),
+    banner: $("sv-banner"), bannerText: $("sv-banner-text"), resume: $("sv-resume"),
+    empty: $("sv-empty"), list: $("sv-list"),
+  };
+
+  const storage = {
+    get(key) { try { return localStorage.getItem(key); } catch (_) { return null; } },
+    set(key, value) { try { localStorage.setItem(key, value); } catch (_) {} },
+  };
+
+  let ws = null, wanted = false, opened = false, retry = 0, retryTimer = null;
+  let paused = false, pending = [], dropped = 0, received = 0;
+
+  // ?token=&prefix= prefill the form; the token is then stripped from the address bar.
+  const params = new URLSearchParams(location.search);
+  els.token.value = params.get("token") ?? storage.get("wh.stream.token") ?? "";
+  els.prefix.value = params.get("prefix") ?? storage.get("wh.stream.prefix") ?? "";
+  if (params.has("token")) {
+    params.delete("token");
+    const rest = params.toString();
+    history.replaceState(null, "", location.pathname + (rest ? "?" + rest : ""));
+  }
+  if (!TOKEN_REQUIRED) els.token.placeholder = "Not required (stream.token is unset)";
+
+  // ---------- connection ----------
+
+  function streamUrl() {
+    const q = new URLSearchParams();
+    const token = els.token.value.trim();
+    const prefix = els.prefix.value.trim();
+    if (token) q.set("token", token);
+    if (prefix) q.set("prefix", prefix);
+    const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    const qs = q.toString();
+    return scheme + location.host + ADMIN_PREFIX + "/stream" + (qs ? "?" + qs : "");
+  }
+
+  function openSocket() {
+    clearTimeout(retryTimer);
+    const sock = new WebSocket(streamUrl());
+    ws = sock;
+    opened = false;
+    setStatus("connecting", "Connecting…");
+    sock.onopen = () => {
+      if (sock !== ws) return;
+      opened = true;
+      retry = 0;
+      showConnectedStatus();
+    };
+    sock.onmessage = (e) => {
+      if (sock !== ws) return;
+      let ev;
+      try { ev = JSON.parse(e.data); } catch (_) { return; }
+      received++;
+      if (paused) {
+        pending.push(ev);
+        if (pending.length > MAX_CARDS) { pending.shift(); dropped++; }
+        updateBanner();
+      } else {
+        prependCards([ev]);
+      }
+      updateCounts();
+    };
+    sock.onclose = () => {
+      if (sock !== ws) return;
+      ws = null;
+      if (!wanted) { setStatus("off", "Disconnected"); return; }
+      const delay = Math.min(30000, 1000 * 2 ** retry);
+      retry++;
+      const secs = Math.round(delay / 1000);
+      setStatus("error", opened
+        ? `Connection lost · retrying in ${secs}s`
+        : `Cannot connect (check token) · retrying in ${secs}s`);
+      retryTimer = setTimeout(openSocket, delay);
+    };
+  }
+
+  function closeSocket() {
+    clearTimeout(retryTimer);
+    if (ws) { const old = ws; ws = null; old.close(); }
+  }
+
+  function connect() {
+    storage.set("wh.stream.token", els.token.value.trim());
+    storage.set("wh.stream.prefix", els.prefix.value.trim());
+    wanted = true;
+    retry = 0;
+    closeSocket();
+    openSocket();
+    syncButtons();
+  }
+
+  function disconnect() {
+    wanted = false;
+    closeSocket();
+    setStatus("off", "Disconnected");
+    syncButtons();
+  }
+
+  function syncButtons() {
+    els.connect.textContent = wanted ? "Reconnect" : "Connect";
+    els.disconnect.hidden = !wanted;
+  }
+
+  function setStatus(kind, text) {
+    els.status.className = "sv-status " + kind;
+    els.status.querySelector("b").textContent = text;
+  }
+
+  function showConnectedStatus() {
+    if (!ws || !opened) return;
+    if (paused) setStatus("paused", "Paused · stream still running");
+    else setStatus("live", "Live");
+  }
+
+  // ---------- pause / list ----------
+
+  function setPaused(value) {
+    paused = value;
+    els.pause.textContent = paused ? "Resume" : "Pause";
+    if (!paused) {
+      const batch = pending;
+      pending = [];
+      dropped = 0;
+      prependCards(batch);
+      updateCounts();
+    }
+    updateBanner();
+    showConnectedStatus();
+  }
+
+  function updateBanner() {
+    els.banner.hidden = !paused;
+    if (!paused) return;
+    const waiting = pending.length + dropped;
+    els.bannerText.textContent = waiting === 0
+      ? "Paused — the stream keeps running; new requests wait here."
+      : `Paused — ${fmtInt(waiting)} new request${waiting === 1 ? "" : "s"} waiting`
+        + (dropped ? ` (latest ${MAX_CARDS} kept)` : "");
+  }
+
+  function updateCounts() {
+    const shown = els.list.childElementCount;
+    els.counts.textContent = `${fmtInt(received)} received · ${fmtInt(shown)} shown`;
+    els.empty.hidden = shown > 0;
+  }
+
+  /** Events arrive oldest first; the newest ends up on top. */
+  function prependCards(events) {
+    if (events.length === 0) return;
+    const fresh = events.length <= 20;
+    const frag = document.createDocumentFragment();
+    for (let i = events.length - 1; i >= 0 && frag.childNodes.length < MAX_CARDS; i--) {
+      frag.append(buildCard(events[i], fresh));
+    }
+    els.list.prepend(frag);
+    while (els.list.childElementCount > MAX_CARDS) els.list.lastElementChild.remove();
+  }
+
+  // ---------- cards ----------
+
+  function buildCard(ev, fresh) {
+    const body = ev.body || {};
+    const card = el("article", "sv-card" + (fresh ? " fresh" : ""));
+    const head = el("div", "sv-head");
+    head.tabIndex = 0;
+    head.setAttribute("role", "button");
+    head.setAttribute("aria-expanded", "false");
+
+    const path = el("span", "sv-path", ev.path || "/");
+    if (ev.query) path.append(el("span", "query", "?" + ev.query));
+    path.title = (ev.path || "/") + (ev.query ? "?" + ev.query : "");
+
+    const time = el("time", "sv-time", fmtTime(ev.received_at));
+    time.title = ev.received_at || "";
+
+    head.append(
+      methodChip(ev.method),
+      path,
+      el("span", "sv-size", humanBytes(body.original_size || 0)),
+      statusPill(ev),
+      time,
+      el("span", "sv-chev", "▸"),
+    );
+    card.append(head);
+
+    const snip = snippet(ev);
+    if (snip) card.append(el("div", "sv-snippet" + (snip.muted ? " muted" : ""), snip.text));
+
+    let detail = null;
+    const toggle = () => {
+      const open = !card.classList.contains("open");
+      if (open && !detail) {
+        detail = buildDetail(ev);
+        card.append(detail);
+      }
+      card.classList.toggle("open", open);
+      if (detail) detail.hidden = !open;
+      head.setAttribute("aria-expanded", String(open));
+    };
+    head.addEventListener("click", toggle);
+    head.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+    });
+    return card;
+  }
+
+  function snippet(ev) {
+    const size = (ev.body && ev.body.original_size) || 0;
+    if (ev.body_base64 == null) {
+      if (size === 0) return null;
+      return { text: "Body not streamed: " + (ev.body_truncated_reason || "unavailable"), muted: true };
+    }
+    if (ev.body_base64 === "") return null;
+    const bytes = b64ToBytes(ev.body_base64.slice(0, SNIPPET_B64_CHARS));
+    if (looksBinary(bytes)) return { text: `Binary body · ${humanBytes(size)}`, muted: true };
+    const text = new TextDecoder().decode(bytes).replace(/\s+/g, " ").trim();
+    return { text: text.slice(0, 240), muted: false };
+  }
+
+  function buildDetail(ev) {
+    const body = ev.body || {};
+    const detail = el("div", "sv-detail");
+
+    const summary = el("div", "summary");
+    const add = (label, value) => {
+      const box = el("div");
+      box.append(el("span", null, label), el("b", null, value));
+      summary.append(box);
+    };
+    add("Request ID", ev.id || "—");
+    add("Received", ev.received_at || "—");
+    add("Content type", body.content_type || "—");
+    let size = humanBytes(body.original_size || 0);
+    if (body.stored) {
+      size += ` (${humanBytes(body.stored_size || 0)} stored${body.encoding ? ", " + body.encoding : ""})`;
+    }
+    add("Size", size);
+    if (body.error) add("Error", body.error);
+    detail.append(summary);
+
+    detail.append(bodySection(ev));
+    detail.append(headersSection(ev.headers || {}));
+
+    const raw = el("details", "sv-raw");
+    raw.append(el("summary", null, "Raw event"));
+    const rawEvent = Object.assign({}, ev);
+    if (typeof rawEvent.body_base64 === "string" && rawEvent.body_base64.length > 160) {
+      rawEvent.body_base64 = rawEvent.body_base64.slice(0, 160) + `… (${fmtInt(ev.body_base64.length)} chars)`;
+    }
+    raw.append(el("pre", null, JSON.stringify(rawEvent, null, 2)));
+    detail.append(raw);
+    return detail;
+  }
+
+  function bodySection(ev) {
+    const body = ev.body || {};
+    const { section, heading, tools } = sectionEl("Body");
+
+    if (ev.body_truncated) {
+      const shown = ev.body_base64 == null ? 0 : b64Length(ev.body_base64);
+      const note = el("p", "sv-note",
+        `Truncated: ${ev.body_truncated_reason || "unknown reason"}` +
+        (ev.body_base64 == null ? "" : ` — showing ${humanBytes(shown)} of ${humanBytes(body.original_size || 0)}`));
+      section.append(note);
+    }
+    if (ev.body_base64 == null || ev.body_base64 === "") {
+      if (!ev.body_truncated) section.append(el("p", "muted", "Empty body."));
+      return section;
+    }
+
+    const bytes = b64ToBytes(ev.body_base64);
+    const view = renderBody(bytes, body.content_type || "");
+    heading.insertBefore(el("span", "sv-kind", view.kind), tools);
+
+    const pre = el("pre");
+    if (view.text.length > DISPLAY_LIMIT) {
+      pre.textContent = view.text.slice(0, DISPLAY_LIMIT);
+      const more = el("button", "secondary sv-more", `Show all (${humanBytes(view.text.length)})`);
+      more.type = "button";
+      more.addEventListener("click", () => { pre.textContent = view.text; more.remove(); });
+      section.append(pre, more);
+    } else {
+      pre.textContent = view.text;
+      section.append(pre);
+    }
+
+    const copy = el("button", "secondary", view.kind === "Binary" ? "Copy base64" : "Copy");
+    copy.type = "button";
+    copy.addEventListener("click", () =>
+      copyText(view.kind === "Binary" ? ev.body_base64 : view.raw, copy));
+    const download = el("button", "secondary", "Download");
+    download.type = "button";
+    download.addEventListener("click", () => {
+      const ext = view.kind === "JSON" ? ".json" : view.kind === "Binary" ? ".bin" : ".txt";
+      const url = URL.createObjectURL(new Blob([bytes], { type: body.content_type || "application/octet-stream" }));
+      const a = el("a");
+      a.href = url;
+      a.download = (ev.id || "body") + ext;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+    tools.append(copy, download);
+    return section;
+  }
+
+  function renderBody(bytes, contentType) {
+    if (looksBinary(bytes.subarray(0, 4096))) {
+      let text = hexdump(bytes.subarray(0, HEXDUMP_LIMIT));
+      if (bytes.length > HEXDUMP_LIMIT) text += `\n… ${humanBytes(bytes.length - HEXDUMP_LIMIT)} more`;
+      return { kind: "Binary", text, raw: null };
+    }
+    const raw = new TextDecoder().decode(bytes);
+    const trimmed = raw.trimStart();
+    if (/json/i.test(contentType) || trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try { return { kind: "JSON", text: JSON.stringify(JSON.parse(raw), null, 2), raw }; } catch (_) {}
+    }
+    if (/x-www-form-urlencoded/i.test(contentType)) {
+      const lines = [];
+      for (const [k, v] of new URLSearchParams(raw)) lines.push(`${k} = ${v}`);
+      if (lines.length) return { kind: "Form", text: lines.join("\n"), raw };
+    }
+    return { kind: "Text", text: raw, raw };
+  }
+
+  function headersSection(headers) {
+    const { section } = sectionEl("Headers");
+    const table = el("table", "sv-headers");
+    const tbody = el("tbody");
+    for (const name of Object.keys(headers).sort()) {
+      const values = Array.isArray(headers[name]) ? headers[name] : [headers[name]];
+      for (const value of values) {
+        const tr = el("tr");
+        tr.append(el("td", "sv-hname", name), el("td", "sv-hval", String(value)));
+        tbody.append(tr);
+      }
+    }
+    if (!tbody.childElementCount) {
+      const tr = el("tr");
+      const td = el("td", "empty", "No headers.");
+      td.colSpan = 2;
+      tr.append(td);
+      tbody.append(tr);
+    }
+    table.append(tbody);
+    section.append(table);
+    return section;
+  }
+
+  function sectionEl(title) {
+    const section = el("section", "sv-section");
+    const heading = el("h3", null, title);
+    const tools = el("span", "sv-tools");
+    heading.append(tools);
+    section.append(heading);
+    return { section, heading, tools };
+  }
+
+  function methodChip(method) {
+    const m = String(method || "?");
+    const cls = { GET: "get", POST: "post", PUT: "put", PATCH: "put", DELETE: "delete" }[m] || "other";
+    return el("span", "method " + cls, m);
+  }
+
+  function statusPill(ev) {
+    const body = ev.body || {};
+    if (body.limit_exceeded) return el("span", "pill warn", "⚠ limit exceeded");
+    if (!body.complete) return el("span", "pill bad", "✗ incomplete");
+    if (ev.body_truncated) return el("span", "pill warn", "✂ truncated");
+    return el("span", "pill ok", "✓ complete");
+  }
+
+  // ---------- helpers ----------
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function b64Length(b64) {
+    const pad = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+    return (b64.length / 4) * 3 - pad;
+  }
+
+  function looksBinary(bytes) {
+    if (bytes.length === 0) return false;
+    let control = 0;
+    for (const b of bytes) {
+      if (b === 0) return true;
+      if (b < 0x09 || (b > 0x0d && b < 0x20)) control++;
+    }
+    return control / bytes.length > 0.1;
+  }
+
+  function hexdump(bytes) {
+    const lines = [];
+    for (let off = 0; off < bytes.length; off += 16) {
+      const row = bytes.subarray(off, off + 16);
+      let hex = "", ascii = "";
+      for (let i = 0; i < 16; i++) {
+        if (i < row.length) {
+          hex += row[i].toString(16).padStart(2, "0") + " ";
+          ascii += row[i] >= 0x20 && row[i] < 0x7f ? String.fromCharCode(row[i]) : ".";
+        } else {
+          hex += "   ";
+        }
+        if (i === 7) hex += " ";
+      }
+      lines.push(off.toString(16).padStart(8, "0") + "  " + hex + " " + ascii);
+    }
+    return lines.join("\n");
+  }
+
+  function humanBytes(bytes) {
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let value = bytes, unit = 0;
+    while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+    return unit === 0 ? `${bytes} B` : `${value.toFixed(1)} ${units[unit]}`;
+  }
+
+  function fmtInt(n) { return n.toLocaleString(); }
+
+  function fmtTime(iso) {
+    const d = new Date(iso);
+    if (isNaN(d)) return iso || "";
+    const pad = (n, w = 2) => String(n).padStart(w, "0");
+    const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+    return d.toDateString() === new Date().toDateString()
+      ? time
+      : `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${time}`;
+  }
+
+  async function copyText(text, button) {
+    const label = button.textContent;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // Clipboard API needs https; plain-http deployments use the legacy path.
+        const ta = el("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.append(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        if (!ok) throw new Error("copy failed");
+      }
+      button.textContent = "Copied";
+    } catch (_) {
+      button.textContent = "Copy failed";
+    }
+    setTimeout(() => { button.textContent = label; }, 1200);
+  }
+
+  // ---------- wiring ----------
+
+  els.form.addEventListener("submit", (e) => { e.preventDefault(); connect(); });
+  els.disconnect.addEventListener("click", disconnect);
+  els.pause.addEventListener("click", () => setPaused(!paused));
+  els.resume.addEventListener("click", () => setPaused(false));
+  els.collapse.addEventListener("click", () => {
+    for (const card of els.list.querySelectorAll(".sv-card.open")) {
+      card.querySelector(".sv-head").click();
+    }
+  });
+  els.clear.addEventListener("click", () => {
+    els.list.replaceChildren();
+    pending = [];
+    dropped = 0;
+    updateBanner();
+    updateCounts();
+  });
+
+  updateCounts();
+  if (els.token.value || !TOKEN_REQUIRED) connect();
+  else els.token.focus();
+})();
+</script>

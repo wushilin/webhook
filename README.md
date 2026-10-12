@@ -296,6 +296,7 @@ Served under `server.admin_prefix` (default `/_wh_admin`):
 | `/_wh_admin/requests/<id>` | Request detail with headers and body preview for requests still in the recent-request buffer |
 | `/_wh_admin/login`, `/logout` | Session login/logout (only when `admin.password` is set) |
 | `/_wh_admin/stream` | WebSocket stream of captured requests (see below) |
+| `/_wh_admin/streamview` | Live browser view of the stream (see below) |
 
 Paths that merely resemble the admin prefix (e.g. `/_wh_adminfoo`) are still captured as webhooks.
 
@@ -310,6 +311,18 @@ Add `?prefix=/api/v1` to receive only requests whose path is `/api/v1` or is und
 ```sh
 websocat -H 'Authorization: Bearer change-me' 'ws://127.0.0.1:8080/_wh_admin/stream?prefix=/api/v1'
 ```
+
+### Live view
+
+`/_wh_admin/streamview` shows the stream in the browser. Enter the stream token and an optional path prefix, and new requests appear on top as cards. Click a card to expand it and see:
+
+- **Summary:** size, content type and request id.
+- **Body:** pretty-printed JSON, a form field list, plain text, or a hex dump for binary bodies, with buttons to copy or download it.
+- **Headers and raw event:** every header, plus the raw JSON event.
+
+**Pause** only freezes the page. The WebSocket stays connected, and new requests wait in a banner until you resume. The page keeps the latest 500 cards and drops the oldest. It reconnects automatically if the connection drops.
+
+The page itself is served without the admin login, because it holds no data; everything it shows comes through the token-protected stream. You can prefill the form with `/_wh_admin/streamview?token=…&prefix=…`. The token is then removed from the address bar, and the page remembers the token and prefix in the browser's local storage.
 
 ### Message format
 
