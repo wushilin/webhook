@@ -807,9 +807,9 @@ fn admin_prefix(state: &AppState) -> String {
 /// `30 days`, `2 hours`, `45 min`: coarse, for display only.
 fn short_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
-    let (value, unit) = if secs >= 86_400 && secs % 86_400 == 0 {
+    let (value, unit) = if secs >= 86_400 && secs.is_multiple_of(86_400) {
         (secs / 86_400, "day")
-    } else if secs >= 3_600 && secs % 3_600 == 0 {
+    } else if secs >= 3_600 && secs.is_multiple_of(3_600) {
         (secs / 3_600, "hour")
     } else if secs >= 60 {
         (secs / 60, "min")
